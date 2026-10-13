@@ -11,6 +11,7 @@ public partial class MainForm : Form
     private long? _startPointMs;
     private long? _endPointMs;
     private bool _isDraggingProgress;
+    private bool _fileOpened;
     private Bitmap? _currentFrame;
     private readonly object _frameLock = new();
 
@@ -32,8 +33,16 @@ public partial class MainForm : Form
         _btnPlay.Click += (s, e) => _player.Play();
         _btnPause.Click += (s, e) => _player.Pause();
         _btnStop.Click += (s, e) => _player.Stop();
-        _btnSetStart.Click += BtnSetStart_Click;
-        _btnSetEnd.Click += BtnSetEnd_Click;
+        _btnSetStart.Click += (s, e) => SetStartPoint(_player.CurrentPositionMs);
+        _btnSetEnd.Click += (s, e) => SetEndPoint(_player.CurrentPositionMs);
+        _btnPrevFrame.Click += (s, e) => _player.StepFrame(-1);
+        _btnNextFrame.Click += (s, e) => _player.StepFrame(1);
+
+        // 时间点编辑（按钮或点击时间文字）
+        _btnEditStart.Click += (s, e) => EditStartPoint();
+        _btnEditEnd.Click += (s, e) => EditEndPoint();
+        _lblStartTime.Click += (s, e) => EditStartPoint();
+        _lblEndTime.Click += (s, e) => EditEndPoint();
 
         // 进度条事件
         _progressBar.MouseDown += ProgressBar_MouseDown;
@@ -45,6 +54,10 @@ public partial class MainForm : Form
         this.DragEnter += MainForm_DragEnter;
         this.DragDrop += MainForm_DragDrop;
 
+        // 键盘快捷键
+        this.KeyPreview = true;
+        this.KeyDown += MainForm_KeyDown;
+
         this.FormClosing += MainForm_FormClosing;
     }
 
@@ -55,7 +68,7 @@ public partial class MainForm : Form
         using var ofd = new OpenFileDialog
         {
             Title = "选择视频文件",
-            Filter = "视频文件|*.mp4;*.mkv;*.avi;*.mov;*.flv;*.wmv;*.m4v;*.ts;*.webm;*.m3u8|" +
+            Filter = "视频文件|*.mp4;*.mkv;*.avi;*.mov;*.flv;*.wmv;*.m4v;*.ts;*.webm|" +
                      "所有文件|*.*"
         };
 
@@ -95,18 +108,25 @@ public partial class MainForm : Form
 
             if (_player.Open(filePath))
             {
-                _lblFileInfo.Text = $"文件: {Path.GetFileName(filePath)}  |  时长: {TimeFormatter.Format(_player.DurationMs)}";
+                _fileOpened = true;
+                _lblFileInfo.Text = $"文件: {Path.GetFileName(filePath)}  |  时长: {TimeFormatter.Format(_player.DurationMs)}" +
+                                    (_player.Fps > 0 ? $"  |  {_player.Fps:F2} fps" : "");
                 _btnPlay.Enabled = true;
                 _btnPause.Enabled = true;
                 _btnStop.Enabled = true;
                 _btnSetStart.Enabled = true;
                 _btnSetEnd.Enabled = true;
+                _btnPrevFrame.Enabled = true;
+                _btnNextFrame.Enabled = true;
+                _btnEditStart.Enabled = true;
+                _btnEditEnd.Enabled = true;
                 _progressBar.Enabled = true;
                 _progressBar.Value = 0;
                 _lblDuration.Text = TimeFormatter.Format(_player.DurationMs);
             }
             else
             {
+                _fileOpened = false;
                 MessageBox.Show("打开视频文件失败，请查看错误信息。", "错误",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
@@ -119,6 +139,53 @@ public partial class MainForm : Form
         finally
         {
             this.Cursor = Cursors.Default;
+        }
+    }
+
+    #endregion
+
+    #region 快捷键
+
+    private void MainForm_KeyDown(object? sender, KeyEventArgs e)
+    {
+        if (!_fileOpened) return;
+
+        switch (e.KeyCode)
+        {
+            case Keys.Space:
+                if (_player.IsPlaying)
+                {
+                    _player.Pause();
+                }
+                else
+                {
+                    _player.Play();
+                }
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                break;
+
+            case Keys.Right:
+                _player.StepFrame(1);
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                break;
+
+            case Keys.Left:
+                _player.StepFrame(-1);
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                break;
+
+            case Keys.I:
+                SetStartPoint(_player.CurrentPositionMs);
+                e.Handled = true;
+                break;
+
+            case Keys.O:
+                SetEndPoint(_player.CurrentPositionMs);
+                e.Handled = true;
+                break;
         }
     }
 
@@ -189,7 +256,7 @@ public partial class MainForm : Form
             this.BeginInvoke(new Action<bool>(OnPlayStateChanged), isPlaying);
             return;
         }
-        _btnPlay.Enabled = !isPlaying;
+        _btnPlay.Enabled = !isPlaying && _fileOpened;
         _btnPause.Enabled = isPlaying;
     }
 
@@ -253,18 +320,46 @@ public partial class MainForm : Form
 
     #endregion
 
-    #region 时间点设置
+    #region 时间点设置与编辑
 
-    private void BtnSetStart_Click(object? sender, EventArgs e)
+    private void SetStartPoint(long ms)
     {
-        _startPointMs = _player.CurrentPositionMs;
+        _startPointMs = ms;
         UpdateTimePointLabels();
     }
 
-    private void BtnSetEnd_Click(object? sender, EventArgs e)
+    private void SetEndPoint(long ms)
     {
-        _endPointMs = _player.CurrentPositionMs;
+        _endPointMs = ms;
         UpdateTimePointLabels();
+    }
+
+    private void EditStartPoint()
+    {
+        if (!_fileOpened) return;
+
+        long initial = _startPointMs ?? _player.CurrentPositionMs;
+        using var dlg = new TimePointEditor("编辑起点时间", initial,
+            _player.FrameDurationMs, _player.DurationMs);
+        if (dlg.ShowDialog(this) == DialogResult.OK)
+        {
+            _startPointMs = dlg.ResultValue;
+            UpdateTimePointLabels();
+        }
+    }
+
+    private void EditEndPoint()
+    {
+        if (!_fileOpened) return;
+
+        long initial = _endPointMs ?? _player.CurrentPositionMs;
+        using var dlg = new TimePointEditor("编辑终点时间", initial,
+            _player.FrameDurationMs, _player.DurationMs);
+        if (dlg.ShowDialog(this) == DialogResult.OK)
+        {
+            _endPointMs = dlg.ResultValue;
+            UpdateTimePointLabels();
+        }
     }
 
     private void UpdateTimePointLabels()
@@ -287,7 +382,7 @@ public partial class MainForm : Form
             _lblEndTime.Text = "终点: --:--:--.---";
         }
 
-        // 计算两点间耗时
+        // 计算两点间耗时（取绝对差值，起点/终点顺序不限）
         if (_startPointMs.HasValue && _endPointMs.HasValue)
         {
             long diff = Math.Abs(_endPointMs.Value - _startPointMs.Value);

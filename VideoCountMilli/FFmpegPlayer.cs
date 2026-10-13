@@ -11,7 +11,7 @@ namespace VideoCountMilli;
 /// <summary>
 /// 基于 FFmpeg 的视频播放器，提供帧级 PTS 毫秒精度计时。
 /// 视频帧通过 FFmpeg 解码并转换为 RGB 位图，音频通过 NAudio 播放，
-/// 以音频时钟作为主时钟进行音视频同步。
+/// 以音频时钟作为主时钟进行音视频同步；支持逐帧步进（前一帧/后一帧）。
 /// </summary>
 public sealed unsafe class FFmpegPlayer : IDisposable
 {
@@ -73,10 +73,11 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     private SwsContext* _swsCtx;
     private SwrContext* _swrCtx;
 
-    // 视频帧尺寸
+    // 视频参数
     private int _videoWidth;
     private int _videoHeight;
     private AVPixelFormat _srcPixelFormat;
+    private double _frameDurationMs = 40.0;  // 平均帧时长（毫秒），默认 25fps
 
     // 音频参数（输出）
     private const int OutSampleRate = 44100;
@@ -95,16 +96,19 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     private volatile bool _isDisposed;
     private Thread? _decodeThread;
     private readonly ManualResetEventSlim _pauseEvent = new(true);
-    private readonly object _seekLock = new();
+
+    // 解码器/封装器互斥锁：解码线程、Seek、逐帧步进共用，
+    // 避免对 AVFormatContext/AVCodecContext 的并发访问
+    private readonly object _decoderLock = new();
 
     // 时间状态（毫秒）
     private long _currentPositionMs;
     private long _durationMs;
     private readonly object _positionLock = new();
 
-    // 用于估算音频时钟的 Stopwatch
+    // 无音频流时的壁钟；有音频时音频时钟 = 基准 + 已播放字节换算
     private readonly System.Diagnostics.Stopwatch _audioStopwatch = new();
-    private long _audioClockBaseMs;   // 暂停/seek 时的基准音频时钟
+    private long _audioClockBaseMs;   // 暂停/seek/步进时的时钟基准
 
     #endregion
 
@@ -113,6 +117,13 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     public bool IsPlaying => _isRunning && !_isPaused;
     public bool IsPaused => _isPaused;
     public long DurationMs => _durationMs;
+
+    /// <summary>平均帧时长（毫秒）。</summary>
+    public double FrameDurationMs => _frameDurationMs;
+
+    /// <summary>帧率（fps）。</summary>
+    public double Fps => _frameDurationMs > 0 ? 1000.0 / _frameDurationMs : 0;
+
     public long CurrentPositionMs
     {
         get
@@ -168,6 +179,18 @@ public sealed unsafe class FFmpegPlayer : IDisposable
                 return false;
             }
 
+            // 计算平均帧时长（用于逐帧步进）
+            AVStream* vStream = _fmtCtx->streams[_videoStreamIndex];
+            AVRational frameRate = vStream->avg_frame_rate;
+            if (frameRate.num <= 0 || frameRate.den <= 0)
+            {
+                frameRate = vStream->r_frame_rate;
+            }
+            if (frameRate.num > 0 && frameRate.den > 0)
+            {
+                _frameDurationMs = 1000.0 * frameRate.den / frameRate.num;
+            }
+
             // 查找音频流（可选）
             _audioStreamIndex = ffmpeg.av_find_best_stream(_fmtCtx, AVMediaType.AVMEDIA_TYPE_AUDIO, -1, -1, null, 0);
 
@@ -219,6 +242,21 @@ public sealed unsafe class FFmpegPlayer : IDisposable
 
         if (!_isRunning)
         {
+            // 已播放到结尾时，从头开始
+            lock (_positionLock)
+            {
+                if (_durationMs > 0 && _currentPositionMs >= _durationMs - 1)
+                {
+                    _currentPositionMs = 0;
+                }
+            }
+            if (CurrentPositionMs == 0)
+            {
+                SeekInternal(0);
+            }
+
+            _audioClockBaseMs = CurrentPositionMs;
+            _audioStopwatch.Restart();
             _isRunning = true;
             _isPaused = false;
             _pauseEvent.Set();
@@ -229,7 +267,7 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         {
             _isPaused = false;
             // 恢复音频时钟基准
-            _audioClockBaseMs = GetCurrentPositionMs();
+            _audioClockBaseMs = CurrentPositionMs;
             _audioStopwatch.Restart();
             _waveOut?.Play();
             _pauseEvent.Set();
@@ -249,14 +287,14 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         _pauseEvent.Reset();
         _waveOut?.Pause();
         // 保存当前音频时钟
-        _audioClockBaseMs = GetCurrentPositionMs();
+        _audioClockBaseMs = CurrentPositionMs;
         _audioStopwatch.Stop();
 
         PlayStateChanged?.Invoke(false);
     }
 
     /// <summary>
-    /// 停止并关闭。
+    /// 停止并回到起始位置。
     /// </summary>
     public void Stop()
     {
@@ -264,7 +302,7 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         _isRunning = false;
         _isPaused = false;
         _pauseEvent.Set();
-        _decodeThread?.Join(500);
+        _decodeThread?.Join(2000);
         _waveOut?.Stop();
         _waveProvider?.ClearBuffer();
         _audioStopwatch.Reset();
@@ -281,34 +319,31 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     {
         if (_isDisposed || _fmtCtx == null) return;
 
-        lock (_seekLock)
+        positionMs = Math.Clamp(positionMs, 0, Math.Max(0, _durationMs));
+        SeekInternal(positionMs);
+        PositionChanged?.Invoke(positionMs);
+    }
+
+    /// <summary>
+    /// 逐帧步进。direction &gt; 0 为下一帧，direction &lt; 0 为上一帧。
+    /// 步进会自动暂停播放，位置精确到目标帧的 PTS。
+    /// </summary>
+    public void StepFrame(int direction)
+    {
+        if (_isDisposed || _fmtCtx == null || _videoCodecCtx == null) return;
+
+        if (IsPlaying)
         {
-            long targetTimestamp = (long)(positionMs * ffmpeg.AV_TIME_BASE / 1000.0);
-            int ret = ffmpeg.av_seek_frame(_fmtCtx, -1, targetTimestamp,
-                ffmpeg.AVSEEK_FLAG_BACKWARD);
-            if (ret < 0)
-            {
-                ret = ffmpeg.avformat_seek_file(_fmtCtx, -1, 0, targetTimestamp, targetTimestamp, 0);
-            }
+            Pause();
+        }
 
-            // 刷新解码器缓冲
-            if (_videoCodecCtx != null)
-                ffmpeg.avcodec_flush_buffers(_videoCodecCtx);
-            if (_audioCodecCtx != null)
-                ffmpeg.avcodec_flush_buffers(_audioCodecCtx);
-
-            // 清空音频缓冲
-            _waveProvider?.ClearBuffer();
-            _audioBytesWritten = 0;
-            _audioClockBaseMs = positionMs;
-            _audioStopwatch.Restart();
-            if (_isPaused) _audioStopwatch.Stop();
-
-            lock (_positionLock)
-            {
-                _currentPositionMs = positionMs;
-            }
-            PositionChanged?.Invoke(positionMs);
+        if (direction >= 0)
+        {
+            StepForward();
+        }
+        else
+        {
+            StepBackward();
         }
     }
 
@@ -328,7 +363,7 @@ public sealed unsafe class FFmpegPlayer : IDisposable
 
     #endregion
 
-    #region 私有方法 - 解码器
+    #region 私有方法 - 解码器初始化
 
     private bool OpenCodec(int streamIndex, out AVCodecContext* codecCtx, AVMediaType type)
     {
@@ -405,6 +440,210 @@ public sealed unsafe class FFmpegPlayer : IDisposable
 
     #endregion
 
+    #region 私有方法 - Seek 与逐帧步进
+
+    /// <summary>执行 seek（不做事件通知，由调用方决定）。</summary>
+    private void SeekInternal(long positionMs)
+    {
+        lock (_decoderLock)
+        {
+            long targetTimestamp = (long)(positionMs * ffmpeg.AV_TIME_BASE / 1000.0);
+            int ret = ffmpeg.av_seek_frame(_fmtCtx, -1, targetTimestamp,
+                ffmpeg.AVSEEK_FLAG_BACKWARD);
+            if (ret < 0)
+            {
+                ffmpeg.avformat_seek_file(_fmtCtx, -1, 0, targetTimestamp, targetTimestamp, 0);
+            }
+
+            // 刷新解码器缓冲
+            if (_videoCodecCtx != null)
+                ffmpeg.avcodec_flush_buffers(_videoCodecCtx);
+            if (_audioCodecCtx != null)
+                ffmpeg.avcodec_flush_buffers(_audioCodecCtx);
+
+            ResetAudioClock(positionMs);
+
+            lock (_positionLock)
+            {
+                _currentPositionMs = positionMs;
+            }
+        }
+    }
+
+    /// <summary>步进到下一帧：优先取解码器缓冲中的帧，否则继续读包。</summary>
+    private void StepForward()
+    {
+        AVPacket* packet = ffmpeg.av_packet_alloc();
+        AVFrame* frame = ffmpeg.av_frame_alloc();
+        bool flushed = false;
+        try
+        {
+            lock (_decoderLock)
+            {
+                ResetAudioClock(GetCurrentPositionMs());
+
+                while (true)
+                {
+                    // 先尝试从解码器取帧（可能还有缓冲帧）
+                    int r = ffmpeg.avcodec_receive_frame(_videoCodecCtx, frame);
+                    if (r == 0)
+                    {
+                        DisplayFrame(frame);
+                        return;
+                    }
+                    if (r != ffmpeg.AVERROR(ffmpeg.EAGAIN))
+                    {
+                        return; // EOF 或解码错误
+                    }
+                    if (flushed)
+                    {
+                        return; // 已刷新过仍无帧
+                    }
+
+                    int readRet = ffmpeg.av_read_frame(_fmtCtx, packet);
+                    if (readRet < 0)
+                    {
+                        // 文件读完，刷新解码器取剩余帧
+                        ffmpeg.avcodec_send_packet(_videoCodecCtx, null);
+                        flushed = true;
+                        continue;
+                    }
+
+                    if (packet->stream_index == _videoStreamIndex)
+                    {
+                        ffmpeg.avcodec_send_packet(_videoCodecCtx, packet);
+                    }
+                    // 逐帧时跳过音频包（恢复播放时从当前位置继续）
+
+                    ffmpeg.av_packet_unref(packet);
+                }
+            }
+        }
+        finally
+        {
+            ffmpeg.av_packet_free(&packet);
+            ffmpeg.av_frame_free(&frame);
+        }
+    }
+
+    /// <summary>步进到上一帧：向前 seek 到目标帧之前，再向前解码到目标帧。</summary>
+    private void StepBackward()
+    {
+        AVPacket* packet = ffmpeg.av_packet_alloc();
+        AVFrame* frame = ffmpeg.av_frame_alloc();
+        try
+        {
+            lock (_decoderLock)
+            {
+                long frameMs = Math.Max(1, (long)Math.Round(_frameDurationMs));
+                long cur = GetCurrentPositionMs();
+                long target = Math.Max(0, cur - frameMs);
+
+                // 向后 seek 到目标帧的前一个位置（保证能解出目标帧）
+                long seekPos = Math.Max(0, target - frameMs);
+                long ts = (long)(seekPos * ffmpeg.AV_TIME_BASE / 1000.0);
+                int ret = ffmpeg.av_seek_frame(_fmtCtx, -1, ts, ffmpeg.AVSEEK_FLAG_BACKWARD);
+                if (ret < 0)
+                {
+                    ffmpeg.avformat_seek_file(_fmtCtx, -1, 0, ts, ts, 0);
+                }
+                ffmpeg.avcodec_flush_buffers(_videoCodecCtx);
+                if (_audioCodecCtx != null)
+                    ffmpeg.avcodec_flush_buffers(_audioCodecCtx);
+                ResetAudioClock(target);
+
+                // 向前解码，直到拿到 pts >= 目标的帧
+                long threshold = target - frameMs / 2;
+
+                while (true)
+                {
+                    int readRet = ffmpeg.av_read_frame(_fmtCtx, packet);
+                    if (readRet < 0)
+                    {
+                        // 文件读完，刷新解码器并显示剩余帧
+                        ffmpeg.avcodec_send_packet(_videoCodecCtx, null);
+                        DrainAndDisplay(frame, long.MinValue / 2);
+                        return;
+                    }
+
+                    if (packet->stream_index == _videoStreamIndex)
+                    {
+                        ffmpeg.avcodec_send_packet(_videoCodecCtx, packet);
+                        if (DrainAndDisplay(frame, threshold))
+                        {
+                            return;
+                        }
+                    }
+
+                    ffmpeg.av_packet_unref(packet);
+                }
+            }
+        }
+        finally
+        {
+            ffmpeg.av_packet_free(&packet);
+            ffmpeg.av_frame_free(&frame);
+        }
+    }
+
+    /// <summary>
+    /// 从解码器取帧并显示第一帧 pts &gt;= threshold 的帧；无合适帧返回 false。
+    /// </summary>
+    private bool DrainAndDisplay(AVFrame* frame, long threshold)
+    {
+        int r;
+        while ((r = ffmpeg.avcodec_receive_frame(_videoCodecCtx, frame)) == 0)
+        {
+            long ptsMs = GetFramePtsMs(frame, _videoStreamIndex);
+            if (ptsMs < 0 || ptsMs >= threshold)
+            {
+                DisplayFrame(frame);
+                ffmpeg.av_frame_unref(frame);
+                return true;
+            }
+            ffmpeg.av_frame_unref(frame);
+        }
+        return false;
+    }
+
+    /// <summary>显示一帧：更新位置（帧 PTS）并通知界面。</summary>
+    private void DisplayFrame(AVFrame* frame)
+    {
+        long ptsMs = GetFramePtsMs(frame, _videoStreamIndex);
+        if (ptsMs >= 0)
+        {
+            lock (_positionLock)
+            {
+                _currentPositionMs = ptsMs;
+            }
+            PositionChanged?.Invoke(ptsMs);
+        }
+
+        Bitmap? bmp = ConvertFrameToBitmap(frame);
+        if (bmp != null)
+        {
+            FrameDecoded?.Invoke(bmp);
+        }
+    }
+
+    /// <summary>重置音频缓冲与时钟基准。</summary>
+    private void ResetAudioClock(long baseMs)
+    {
+        _waveProvider?.ClearBuffer();
+        lock (_audioLock)
+        {
+            _audioBytesWritten = 0;
+        }
+        _audioClockBaseMs = baseMs;
+        _audioStopwatch.Restart();
+        if (_isPaused)
+        {
+            _audioStopwatch.Stop();
+        }
+    }
+
+    #endregion
+
     #region 私有方法 - 解码循环
 
     private void DecodeLoop()
@@ -420,35 +659,46 @@ public sealed unsafe class FFmpegPlayer : IDisposable
                 if (!_isRunning) break;
 
                 int readRet;
-                lock (_seekLock)
+                bool isEof = false;
+                lock (_decoderLock)
                 {
+                    if (!_isRunning) break;
+
                     readRet = ffmpeg.av_read_frame(_fmtCtx, packet);
+                    if (readRet < 0)
+                    {
+                        isEof = readRet == ffmpeg.AVERROR_EOF;
+                    }
+                    else
+                    {
+                        if (packet->stream_index == _videoStreamIndex)
+                        {
+                            DecodeVideoFrame(packet, frame);
+                        }
+                        else if (packet->stream_index == _audioStreamIndex)
+                        {
+                            DecodeAudioFrame(packet, frame);
+                        }
+                        ffmpeg.av_packet_unref(packet);
+                    }
                 }
 
-                if (readRet < 0)
+                if (isEof)
                 {
-                    // EOF 或错误
-                    if (readRet == ffmpeg.AVERROR_EOF)
+                    // 刷新解码器中的剩余帧
+                    lock (_decoderLock)
                     {
-                        // 刷新解码器
-                        FlushDecoder(packet, frame, true);
-                        // 等待音频播放完
-                        DrainAudio();
-                        PlaybackEnded?.Invoke();
+                        FlushVideoDecoder(frame);
                     }
+                    // 等待音频播放完
+                    DrainAudio();
+                    PlaybackEnded?.Invoke();
                     break;
                 }
-
-                if (packet->stream_index == _videoStreamIndex)
+                if (readRet < 0)
                 {
-                    DecodeVideoFrame(packet, frame);
+                    break; // 读取错误
                 }
-                else if (packet->stream_index == _audioStreamIndex)
-                {
-                    DecodeAudioFrame(packet, frame);
-                }
-
-                ffmpeg.av_packet_unref(packet);
             }
         }
         catch (Exception ex)
@@ -476,27 +726,14 @@ public sealed unsafe class FFmpegPlayer : IDisposable
                 break;
             if (ret < 0) return;
 
-            // 计算帧 PTS（毫秒）
+            // 音视频同步：等待音频时钟（在显示前）
             long ptsMs = GetFramePtsMs(frame, _videoStreamIndex);
             if (ptsMs >= 0)
             {
-                // 音视频同步：等待音频时钟
                 SyncToAudio(ptsMs);
-
-                lock (_positionLock)
-                {
-                    _currentPositionMs = ptsMs;
-                }
-                PositionChanged?.Invoke(ptsMs);
             }
 
-            // 转换并显示帧
-            Bitmap? bmp = ConvertFrameToBitmap(frame);
-            if (bmp != null)
-            {
-                FrameDecoded?.Invoke(bmp);
-            }
-
+            DisplayFrame(frame);
             ffmpeg.av_frame_unref(frame);
         }
     }
@@ -551,20 +788,13 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         }
     }
 
-    private void FlushDecoder(AVPacket* packet, AVFrame* frame, bool isVideo)
+    private void FlushVideoDecoder(AVFrame* frame)
     {
         // 向解码器发送 NULL packet 以刷新
         ffmpeg.avcodec_send_packet(_videoCodecCtx, null);
         while (ffmpeg.avcodec_receive_frame(_videoCodecCtx, frame) >= 0)
         {
-            long ptsMs = GetFramePtsMs(frame, _videoStreamIndex);
-            if (ptsMs >= 0)
-            {
-                lock (_positionLock) { _currentPositionMs = ptsMs; }
-                PositionChanged?.Invoke(ptsMs);
-            }
-            Bitmap? bmp = ConvertFrameToBitmap(frame);
-            if (bmp != null) FrameDecoded?.Invoke(bmp);
+            DisplayFrame(frame);
             ffmpeg.av_frame_unref(frame);
         }
     }
@@ -617,14 +847,15 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     }
 
     /// <summary>
-    /// 获取当前音频时钟（毫秒）。
+    /// 获取当前主时钟（毫秒）。有音频流时基于已播放音频字节；
+    /// 无音频流时使用壁钟（基于上次基准 + 经过时间）。
     /// </summary>
     private long GetAudioClockMs()
     {
         if (_waveProvider == null)
         {
-            // 无音频时用当前位置
-            return GetCurrentPositionMs();
+            // 无音频：壁钟
+            return _audioClockBaseMs + _audioStopwatch.ElapsedMilliseconds;
         }
 
         double bytesPerSec = OutSampleRate * OutChannels * 2;
@@ -723,6 +954,8 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         _audioBytesWritten = 0;
         _audioClockBaseMs = 0;
         _audioStopwatch.Reset();
+        lock (_positionLock) { _currentPositionMs = 0; }
+        _durationMs = 0;
     }
 
     #endregion
