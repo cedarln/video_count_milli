@@ -1,0 +1,17 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Build output
+publish/
+
+# FFmpeg binaries (kept in repo for convenience)
+# ffmpeg/*.dll
+
+# IDE
+.idea/
+*.swp
+*~

@@ -1,0 +1,317 @@
+using System;
+using System.Drawing;
+using System.IO;
+using System.Windows.Forms;
+
+namespace VideoCountMilli;
+
+public partial class MainForm : Form
+{
+    private readonly FFmpegPlayer _player;
+    private long? _startPointMs;
+    private long? _endPointMs;
+    private bool _isDraggingProgress;
+    private Bitmap? _currentFrame;
+    private readonly object _frameLock = new();
+
+    public MainForm()
+    {
+        InitializeComponent();
+        _player = new FFmpegPlayer();
+
+        // 绑定事件
+        _player.FrameDecoded += OnFrameDecoded;
+        _player.PositionChanged += OnPositionChanged;
+        _player.DurationChanged += OnDurationChanged;
+        _player.PlayStateChanged += OnPlayStateChanged;
+        _player.PlaybackEnded += OnPlaybackEnded;
+        _player.Error += OnPlayerError;
+
+        // 按钮事件
+        _btnOpen.Click += BtnOpen_Click;
+        _btnPlay.Click += (s, e) => _player.Play();
+        _btnPause.Click += (s, e) => _player.Pause();
+        _btnStop.Click += (s, e) => _player.Stop();
+        _btnSetStart.Click += BtnSetStart_Click;
+        _btnSetEnd.Click += BtnSetEnd_Click;
+
+        // 进度条事件
+        _progressBar.MouseDown += ProgressBar_MouseDown;
+        _progressBar.MouseUp += ProgressBar_MouseUp;
+        _progressBar.Scroll += ProgressBar_Scroll;
+
+        // 拖放文件支持
+        this.AllowDrop = true;
+        this.DragEnter += MainForm_DragEnter;
+        this.DragDrop += MainForm_DragDrop;
+
+        this.FormClosing += MainForm_FormClosing;
+    }
+
+    #region 文件操作
+
+    private void BtnOpen_Click(object? sender, EventArgs e)
+    {
+        using var ofd = new OpenFileDialog
+        {
+            Title = "选择视频文件",
+            Filter = "视频文件|*.mp4;*.mkv;*.avi;*.mov;*.flv;*.wmv;*.m4v;*.ts;*.webm;*.m3u8|" +
+                     "所有文件|*.*"
+        };
+
+        if (ofd.ShowDialog() == DialogResult.OK)
+        {
+            OpenVideoFile(ofd.FileName);
+        }
+    }
+
+    private void MainForm_DragEnter(object? sender, DragEventArgs e)
+    {
+        if (e.Data!.GetDataPresent(DataFormats.FileDrop))
+        {
+            e.Effect = DragDropEffects.Copy;
+        }
+    }
+
+    private void MainForm_DragDrop(object? sender, DragEventArgs e)
+    {
+        var files = (string[]?)e.Data!.GetData(DataFormats.FileDrop);
+        if (files != null && files.Length > 0)
+        {
+            OpenVideoFile(files[0]);
+        }
+    }
+
+    private void OpenVideoFile(string filePath)
+    {
+        try
+        {
+            this.Cursor = Cursors.WaitCursor;
+
+            // 重置时间点
+            _startPointMs = null;
+            _endPointMs = null;
+            UpdateTimePointLabels();
+
+            if (_player.Open(filePath))
+            {
+                _lblFileInfo.Text = $"文件: {Path.GetFileName(filePath)}  |  时长: {TimeFormatter.Format(_player.DurationMs)}";
+                _btnPlay.Enabled = true;
+                _btnPause.Enabled = true;
+                _btnStop.Enabled = true;
+                _btnSetStart.Enabled = true;
+                _btnSetEnd.Enabled = true;
+                _progressBar.Enabled = true;
+                _progressBar.Value = 0;
+                _lblDuration.Text = TimeFormatter.Format(_player.DurationMs);
+            }
+            else
+            {
+                MessageBox.Show("打开视频文件失败，请查看错误信息。", "错误",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"打开文件异常: {ex.Message}", "错误",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            this.Cursor = Cursors.Default;
+        }
+    }
+
+    #endregion
+
+    #region 播放器事件
+
+    private void OnFrameDecoded(Bitmap frame)
+    {
+        if (this.IsDisposed)
+        {
+            frame.Dispose();
+            return;
+        }
+
+        // 在 UI 线程更新画面
+        if (this.InvokeRequired)
+        {
+            this.BeginInvoke(new Action<Bitmap>(OnFrameDecoded), frame);
+            return;
+        }
+
+        Bitmap? oldFrame;
+        lock (_frameLock)
+        {
+            oldFrame = _currentFrame;
+            _currentFrame = frame;
+        }
+
+        _videoPictureBox.Image = frame;
+        oldFrame?.Dispose();
+    }
+
+    private void OnPositionChanged(long positionMs)
+    {
+        if (this.IsDisposed) return;
+
+        if (this.InvokeRequired)
+        {
+            this.BeginInvoke(new Action<long>(OnPositionChanged), positionMs);
+            return;
+        }
+
+        _lblCurrentTime.Text = TimeFormatter.Format(positionMs);
+
+        if (!_isDraggingProgress && _player.DurationMs > 0)
+        {
+            double ratio = (double)positionMs / _player.DurationMs;
+            int value = (int)Math.Clamp(ratio * _progressBar.Maximum, 0, _progressBar.Maximum);
+            _progressBar.Value = value;
+        }
+    }
+
+    private void OnDurationChanged(long durationMs)
+    {
+        if (this.InvokeRequired)
+        {
+            this.BeginInvoke(new Action<long>(OnDurationChanged), durationMs);
+            return;
+        }
+        _lblDuration.Text = TimeFormatter.Format(durationMs);
+    }
+
+    private void OnPlayStateChanged(bool isPlaying)
+    {
+        if (this.InvokeRequired)
+        {
+            this.BeginInvoke(new Action<bool>(OnPlayStateChanged), isPlaying);
+            return;
+        }
+        _btnPlay.Enabled = !isPlaying;
+        _btnPause.Enabled = isPlaying;
+    }
+
+    private void OnPlaybackEnded()
+    {
+        if (this.InvokeRequired)
+        {
+            this.BeginInvoke(new Action(OnPlaybackEnded));
+            return;
+        }
+        _btnPlay.Enabled = true;
+        _btnPause.Enabled = false;
+    }
+
+    private void OnPlayerError(string message)
+    {
+        if (this.InvokeRequired)
+        {
+            this.BeginInvoke(new Action<string>(OnPlayerError), message);
+            return;
+        }
+        MessageBox.Show(message, "播放器错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+
+    #endregion
+
+    #region 进度条拖动
+
+    private void ProgressBar_MouseDown(object? sender, MouseEventArgs e)
+    {
+        _isDraggingProgress = true;
+    }
+
+    private void ProgressBar_MouseUp(object? sender, MouseEventArgs e)
+    {
+        if (_isDraggingProgress)
+        {
+            SeekToProgressValue();
+            _isDraggingProgress = false;
+        }
+    }
+
+    private void ProgressBar_Scroll(object? sender, EventArgs e)
+    {
+        if (!_isDraggingProgress)
+        {
+            // 键盘操作时直接跳转
+            SeekToProgressValue();
+        }
+    }
+
+    private void SeekToProgressValue()
+    {
+        if (_player.DurationMs <= 0) return;
+
+        double ratio = (double)_progressBar.Value / _progressBar.Maximum;
+        long targetMs = (long)(ratio * _player.DurationMs);
+        _player.Seek(targetMs);
+        _lblCurrentTime.Text = TimeFormatter.Format(targetMs);
+    }
+
+    #endregion
+
+    #region 时间点设置
+
+    private void BtnSetStart_Click(object? sender, EventArgs e)
+    {
+        _startPointMs = _player.CurrentPositionMs;
+        UpdateTimePointLabels();
+    }
+
+    private void BtnSetEnd_Click(object? sender, EventArgs e)
+    {
+        _endPointMs = _player.CurrentPositionMs;
+        UpdateTimePointLabels();
+    }
+
+    private void UpdateTimePointLabels()
+    {
+        if (_startPointMs.HasValue)
+        {
+            _lblStartTime.Text = $"起点: {TimeFormatter.Format(_startPointMs.Value)}";
+        }
+        else
+        {
+            _lblStartTime.Text = "起点: --:--:--.---";
+        }
+
+        if (_endPointMs.HasValue)
+        {
+            _lblEndTime.Text = $"终点: {TimeFormatter.Format(_endPointMs.Value)}";
+        }
+        else
+        {
+            _lblEndTime.Text = "终点: --:--:--.---";
+        }
+
+        // 计算两点间耗时
+        if (_startPointMs.HasValue && _endPointMs.HasValue)
+        {
+            long diff = Math.Abs(_endPointMs.Value - _startPointMs.Value);
+            _lblSegmentDuration.Text = $"耗时: {TimeFormatter.Format(diff)}";
+        }
+        else
+        {
+            _lblSegmentDuration.Text = "耗时: --:--:--.---";
+        }
+    }
+
+    #endregion
+
+    #region 清理
+
+    private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
+    {
+        _player.Dispose();
+        lock (_frameLock)
+        {
+            _currentFrame?.Dispose();
+            _currentFrame = null;
+        }
+    }
+
+    #endregion
+}
