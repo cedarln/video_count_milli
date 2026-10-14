@@ -110,6 +110,11 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     private readonly System.Diagnostics.Stopwatch _audioStopwatch = new();
     private long _audioClockBaseMs;   // 暂停/seek/步进时的时钟基准
 
+    // 播放速率与音量（速率非 1.0 时音频自动静音，以免音视频不同步）
+    private double _playbackRate = 1.0;
+    private double _volume = 1.0;
+    private bool _muted;
+
     #endregion
 
     #region 属性
@@ -417,6 +422,56 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         {
             StepBackward();
         }
+    }
+
+    /// <summary>
+    /// 设置播放速率（0.25 ~ 4.0）。非 1.0 时音频自动静音（避免音视频不同步），
+    /// 视频按目标速率前进（加速时必要时丢帧追赶）。
+    /// </summary>
+    public void SetPlaybackRate(double rate)
+    {
+        rate = Math.Clamp(rate, 0.25, 4.0);
+        if (Math.Abs(rate - _playbackRate) < 1e-6) return;
+
+        lock (_decoderLock)
+        {
+            _playbackRate = rate;
+
+            // 重置时钟基准，避免速率切换时位置跳变
+            ResetAudioClock(CurrentPositionMs);
+
+            if (rate != 1.0)
+            {
+                // 非原速不输出音频
+                _waveOut?.Pause();
+                _waveProvider?.ClearBuffer();
+            }
+            else if (!_isPaused)
+            {
+                _waveOut?.Play();
+            }
+        }
+    }
+
+    /// <summary>设置音量（0.0 ~ 1.0）。</summary>
+    public void SetVolume(double volume)
+    {
+        _volume = Math.Clamp(volume, 0.0, 1.0);
+        ApplyVolume();
+    }
+
+    /// <summary>静音开关。</summary>
+    public void SetMuted(bool muted)
+    {
+        _muted = muted;
+        ApplyVolume();
+    }
+
+    private void ApplyVolume()
+    {
+        if (_waveOut == null) return;
+        try { _waveOut.Volume = (float)(_muted ? 0.0 : _volume); }
+        catch { /* 部分设备不支持音量控制 */ }
     }
 
     public void Close()
@@ -803,6 +858,13 @@ public sealed unsafe class FFmpegPlayer : IDisposable
             if (ptsMs >= 0)
             {
                 SyncToAudio(ptsMs);
+
+                // 加速播放时，若该帧落后时钟超过一帧，则丢帧追赶
+                if (_playbackRate > 1.0 && ptsMs < GetAudioClockMs() - _frameDurationMs)
+                {
+                    ffmpeg.av_frame_unref(frame);
+                    continue;
+                }
             }
 
             DisplayFrame(frame);
@@ -813,6 +875,9 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     private void DecodeAudioFrame(AVPacket* packet, AVFrame* frame)
     {
         if (_audioCodecCtx == null || _swrCtx == null || _waveProvider == null) return;
+
+        // 非原速播放时跳过音频输出，避免音视频不同步
+        if (_playbackRate != 1.0) return;
 
         int ret = ffmpeg.avcodec_send_packet(_audioCodecCtx, packet);
         if (ret < 0) return;
@@ -924,10 +989,10 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     /// </summary>
     private long GetAudioClockMs()
     {
-        if (_waveProvider == null)
+        if (_waveProvider == null || _playbackRate != 1.0)
         {
-            // 无音频：壁钟
-            return _audioClockBaseMs + _audioStopwatch.ElapsedMilliseconds;
+            // 无音频或非原速：使用（按速率缩放的）壁钟
+            return _audioClockBaseMs + (long)(_audioStopwatch.ElapsedMilliseconds * _playbackRate);
         }
 
         double bytesPerSec = OutSampleRate * OutChannels * 2;

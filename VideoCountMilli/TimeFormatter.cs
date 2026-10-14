@@ -75,4 +75,12 @@ public static class TimeFormatter
         totalMilliseconds = hours * 3_600_000L + minutes * 60_000L + seconds * 1_000L + millis;
         return true;
     }
+
+    /// <summary>
+    /// 将毫秒格式化为可用于文件名的紧凑形式，例如 00-29-59-128。
+    /// </summary>
+    public static string FormatForFileName(long totalMilliseconds)
+    {
+        return Format(totalMilliseconds).Replace(':', '-').Replace('.', '-');
+    }
 }
