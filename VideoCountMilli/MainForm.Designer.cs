@@ -45,7 +45,9 @@ partial class MainForm
 
     // 右侧测量记录面板
     private Panel _historyPanel;
+    private Panel _historyHeader;
     private Panel _historyButtons;
+    private Button _btnToggleHistory;
     private Label _lblHistoryTitle;
     private ListView _lvHistory;
     private Button _btnAddMeasure;
@@ -247,16 +249,37 @@ partial class MainForm
             BackColor = Color.FromArgb(35, 35, 35)
         };
 
-        _lblHistoryTitle = new Label
+        _historyHeader = new Panel
         {
             Dock = DockStyle.Top,
             Height = 28,
+            BackColor = Color.FromArgb(50, 50, 50)
+        };
+
+        _lblHistoryTitle = new Label
+        {
+            Dock = DockStyle.Fill,
             Text = "  测量记录",
             ForeColor = Color.White,
             Font = new Font("Segoe UI", 10F, FontStyle.Bold),
-            TextAlign = ContentAlignment.MiddleLeft,
-            BackColor = Color.FromArgb(50, 50, 50)
+            TextAlign = ContentAlignment.MiddleLeft
         };
+
+        // 折叠 / 展开按钮（停靠在标题栏右侧）
+        _btnToggleHistory = new Button
+        {
+            Dock = DockStyle.Right,
+            Width = 30,
+            Text = "◀",
+            FlatStyle = FlatStyle.Flat,
+            ForeColor = Color.White,
+            BackColor = Color.FromArgb(60, 60, 60),
+            Font = new Font("Segoe UI", 8.5F),
+            TabStop = false
+        };
+
+        _historyHeader.Controls.Add(_lblHistoryTitle);
+        _historyHeader.Controls.Add(_btnToggleHistory);
 
         _lvHistory = new ListView
         {
@@ -288,7 +311,7 @@ partial class MainForm
 
         _historyPanel.Controls.Add(_lvHistory);
         _historyPanel.Controls.Add(_historyButtons);
-        _historyPanel.Controls.Add(_lblHistoryTitle);
+        _historyPanel.Controls.Add(_historyHeader);
 
         // 添加控件（Fill 先加，底部面板后加以保证停靠顺序）
         this.Controls.Add(_videoPictureBox);

@@ -87,7 +87,8 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     // NAudio 播放
     private WaveOut? _waveOut;
     private BufferedWaveProvider? _waveProvider;
-    private long _audioBytesWritten;   // 已写入缓冲的字节数
+    private long _audioBytesWritten;        // 已写入缓冲的累计字节数（自上次时钟重置起）
+    private long _audioBytesConsumedBase;   // 已折算进时钟基准的消耗字节数（暂停时重基准）
     private readonly object _audioLock = new();
 
     // 播放控制
@@ -261,6 +262,12 @@ public sealed unsafe class FFmpegPlayer : IDisposable
             }
 
             _audioClockBaseMs = CurrentPositionMs;
+            _waveProvider?.ClearBuffer();
+            lock (_audioLock)
+            {
+                _audioBytesWritten = 0;
+                _audioBytesConsumedBase = 0;
+            }
             _audioStopwatch.Restart();
             _isRunning = true;
             _isPaused = false;
@@ -271,10 +278,13 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         else if (_isPaused)
         {
             _isPaused = false;
-            // 恢复音频时钟基准
-            _audioClockBaseMs = CurrentPositionMs;
+            // 时钟基准已在 Pause 时冻结（音频路径已重基准），
+            // 壁钟路径从当前位置重新计时
             _audioStopwatch.Restart();
-            _waveOut?.Play();
+            if (_playbackRate == 1.0)
+            {
+                _waveOut?.Play();
+            }
             _pauseEvent.Set();
         }
 
@@ -291,8 +301,19 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         _isPaused = true;
         _pauseEvent.Reset();
         _waveOut?.Pause();
-        // 保存当前音频时钟
-        _audioClockBaseMs = CurrentPositionMs;
+
+        // 冻结主时钟：
+        // 音频路径（原速）把已消耗字节折算进基准，否则恢复播放后会把
+        // 暂停前已播放的时长重复计入时钟，导致画面超前；
+        // 壁钟路径把基准设为当前位置并停表
+        if (_waveProvider != null && _playbackRate == 1.0)
+        {
+            RebaseAudioClock();
+        }
+        else
+        {
+            _audioClockBaseMs = CurrentPositionMs;
+        }
         _audioStopwatch.Stop();
 
         PlayStateChanged?.Invoke(false);
@@ -312,6 +333,7 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         _waveProvider?.ClearBuffer();
         _audioStopwatch.Reset();
         _audioBytesWritten = 0;
+        _audioBytesConsumedBase = 0;
         lock (_positionLock) { _currentPositionMs = 0; }
         PositionChanged?.Invoke(0);
         PlayStateChanged?.Invoke(false);
@@ -760,12 +782,33 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         lock (_audioLock)
         {
             _audioBytesWritten = 0;
+            _audioBytesConsumedBase = 0;
         }
         _audioClockBaseMs = baseMs;
         _audioStopwatch.Restart();
         if (_isPaused)
         {
             _audioStopwatch.Stop();
+        }
+    }
+
+    /// <summary>
+    /// 把已消耗的音频字节数折算进时钟基准（暂停时调用），
+    /// 使恢复播放后主时钟从暂停点继续，而不是把暂停前已播放的时长重复计入。
+    /// </summary>
+    private void RebaseAudioClock()
+    {
+        if (_waveProvider == null) return;
+
+        lock (_audioLock)
+        {
+            long consumed = _audioBytesWritten - _waveProvider.BufferedBytes - _audioBytesConsumedBase;
+            if (consumed > 0)
+            {
+                double bytesPerSec = OutSampleRate * OutChannels * 2;
+                _audioClockBaseMs += (long)(consumed / bytesPerSec * 1000.0);
+                _audioBytesConsumedBase = _audioBytesWritten - _waveProvider.BufferedBytes;
+            }
         }
     }
 
@@ -1001,7 +1044,7 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         long playedBytes;
         lock (_audioLock)
         {
-            playedBytes = _audioBytesWritten - bufferedBytes;
+            playedBytes = _audioBytesWritten - bufferedBytes - _audioBytesConsumedBase;
         }
 
         long clockFromBytes = (long)(playedBytes / bytesPerSec * 1000.0);
@@ -1089,6 +1132,7 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         _videoStreamIndex = -1;
         _audioStreamIndex = -1;
         _audioBytesWritten = 0;
+        _audioBytesConsumedBase = 0;
         _audioClockBaseMs = 0;
         _audioStopwatch.Reset();
         lock (_positionLock) { _currentPositionMs = 0; }

@@ -31,6 +31,11 @@ public partial class MainForm : Form
     private FormWindowState _prevWindowState;
     private Rectangle _prevBounds;
 
+    // 右侧测量记录面板折叠状态
+    private const int HistoryExpandedWidth = 340;
+    private const int HistoryCollapsedWidth = 30;
+    private bool _historyCollapsed;
+
     public MainForm()
     {
         InitializeComponent();
@@ -95,6 +100,7 @@ public partial class MainForm : Form
         _btnClearMeasure.Click += (s, e) => ClearMeasurements();
         _btnCopyMeasure.Click += (s, e) => CopyMeasurements();
         _btnExportMeasure.Click += (s, e) => ExportMeasurements();
+        _btnToggleHistory.Click += (s, e) => SetHistoryCollapsed(!_historyCollapsed);
         _lvHistory.MouseDoubleClick += (s, e) => JumpToMeasurementStart();
 
         // 拖放文件支持
@@ -612,6 +618,19 @@ public partial class MainForm : Form
     private void UpdateHistoryTitle()
     {
         _lblHistoryTitle.Text = $"  测量记录（{_lvHistory.Items.Count}）";
+    }
+
+    /// <summary>折叠或展开右侧测量记录面板；折叠后仅保留一条带展开按钮的窄边。</summary>
+    private void SetHistoryCollapsed(bool collapsed)
+    {
+        _historyCollapsed = collapsed;
+
+        _lvHistory.Visible = !collapsed;
+        _historyButtons.Visible = !collapsed;
+        _lblHistoryTitle.Visible = !collapsed;
+        _btnToggleHistory.Text = collapsed ? "▶" : "◀";
+
+        _historyPanel.Width = collapsed ? HistoryCollapsedWidth : HistoryExpandedWidth;
     }
 
     private string BuildMeasurementsText()
