@@ -325,6 +325,78 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     }
 
     /// <summary>
+    /// 跳转到指定毫秒并立即解码、显示该时刻的画面帧（用于拖动进度条时实时预览）。
+    /// 显示后位置会更新为该帧的真实 PTS，保证时间显示与实际画面一致。
+    /// </summary>
+    public void SeekPreview(long positionMs)
+    {
+        if (_isDisposed || _fmtCtx == null || _videoCodecCtx == null) return;
+
+        positionMs = Math.Clamp(positionMs, 0, Math.Max(0, _durationMs));
+
+        AVPacket* packet = ffmpeg.av_packet_alloc();
+        AVFrame* frame = ffmpeg.av_frame_alloc();
+        try
+        {
+            lock (_decoderLock)
+            {
+                long targetTimestamp = (long)(positionMs * ffmpeg.AV_TIME_BASE / 1000.0);
+                int ret = ffmpeg.av_seek_frame(_fmtCtx, -1, targetTimestamp,
+                    ffmpeg.AVSEEK_FLAG_BACKWARD);
+                if (ret < 0)
+                {
+                    ffmpeg.avformat_seek_file(_fmtCtx, -1, 0, targetTimestamp, targetTimestamp, 0);
+                }
+
+                ffmpeg.avcodec_flush_buffers(_videoCodecCtx);
+                if (_audioCodecCtx != null)
+                    ffmpeg.avcodec_flush_buffers(_audioCodecCtx);
+
+                ResetAudioClock(positionMs);
+
+                lock (_positionLock)
+                {
+                    _currentPositionMs = positionMs;
+                }
+
+                // 向前解码，显示第一帧 pts >= 目标时刻的画面
+                while (true)
+                {
+                    int readRet = ffmpeg.av_read_frame(_fmtCtx, packet);
+                    if (readRet < 0)
+                    {
+                        // 到达文件末尾：刷新解码器，显示剩余最后一帧
+                        ffmpeg.avcodec_send_packet(_videoCodecCtx, null);
+                        DrainAndDisplay(frame, long.MinValue / 2);
+                        return;
+                    }
+
+                    if (packet->stream_index == _videoStreamIndex)
+                    {
+                        ffmpeg.avcodec_send_packet(_videoCodecCtx, packet);
+                        bool shown = DrainAndDisplay(frame, positionMs);
+                        ffmpeg.av_packet_unref(packet);
+                        if (shown) return;
+                    }
+                    else
+                    {
+                        ffmpeg.av_packet_unref(packet);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            OnError($"画面预览异常: {ex.Message}");
+        }
+        finally
+        {
+            ffmpeg.av_packet_free(&packet);
+            ffmpeg.av_frame_free(&frame);
+        }
+    }
+
+    /// <summary>
     /// 逐帧步进。direction &gt; 0 为下一帧，direction &lt; 0 为上一帧。
     /// 步进会自动暂停播放，位置精确到目标帧的 PTS。
     /// </summary>

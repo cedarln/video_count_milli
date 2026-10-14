@@ -15,6 +15,12 @@ public partial class MainForm : Form
     private Bitmap? _currentFrame;
     private readonly object _frameLock = new();
 
+    // 拖动进度条时的实时画面预览（节流，避免频繁 seek 造成卡顿）
+    private bool _wasPlayingBeforeDrag;
+    private readonly System.Windows.Forms.Timer _previewTimer = new();
+    private long _pendingPreviewMs = -1;
+    private long _lastPreviewMs = -1;
+
     public MainForm()
     {
         InitializeComponent();
@@ -27,6 +33,10 @@ public partial class MainForm : Form
         _player.PlayStateChanged += OnPlayStateChanged;
         _player.PlaybackEnded += OnPlaybackEnded;
         _player.Error += OnPlayerError;
+
+        // 拖动进度条时的画面预览节流定时器（40ms 执行一次 seek+解码）
+        _previewTimer.Interval = 40;
+        _previewTimer.Tick += PreviewTimer_Tick;
 
         // 按钮事件
         _btnOpen.Click += BtnOpen_Click;
@@ -121,7 +131,16 @@ public partial class MainForm : Form
                 _btnEditStart.Enabled = true;
                 _btnEditEnd.Enabled = true;
                 _progressBar.Enabled = true;
+                // 进度条最大值设为时长（毫秒），使拖动精度直接对应毫秒
+                int maxVal = (int)Math.Min(int.MaxValue, Math.Max(1, _player.DurationMs));
+                _progressBar.LargeChange = 1;
+                _progressBar.SmallChange = 1;
+                _progressBar.Maximum = maxVal;
+                _progressBar.LargeChange = Math.Max(1, maxVal / 200);
                 _progressBar.Value = 0;
+                _lastPreviewMs = -1;
+                _pendingPreviewMs = -1;
+                _previewTimer.Stop();
                 _lblDuration.Text = TimeFormatter.Format(_player.DurationMs);
             }
             else
@@ -283,39 +302,100 @@ public partial class MainForm : Form
 
     #endregion
 
-    #region 进度条拖动
+    #region 进度条拖动（拖动时画面实时跟随）
 
     private void ProgressBar_MouseDown(object? sender, MouseEventArgs e)
     {
+        if (e.Button != MouseButtons.Left) return;
+        if (_player.DurationMs <= 0) return;
+
         _isDraggingProgress = true;
+        // 拖动时暂停播放，避免解码线程与预览 seek 冲突；记住原状态以便松开后恢复
+        _wasPlayingBeforeDrag = _player.IsPlaying;
+        if (_wasPlayingBeforeDrag)
+        {
+            _player.Pause();
+        }
+
+        // 立即在按下位置显示一帧
+        BeginPreview(_progressBar.Value);
     }
 
     private void ProgressBar_MouseUp(object? sender, MouseEventArgs e)
     {
-        if (_isDraggingProgress)
+        if (!_isDraggingProgress) return;
+
+        _isDraggingProgress = false;
+        _previewTimer.Stop();
+
+        // 松开后在最终位置做一次精确预览，确保画面与进度条一致
+        PreviewSeek(TrackValueToMs(_progressBar.Value));
+
+        // 若拖动前正在播放，则从新位置继续播放
+        if (_wasPlayingBeforeDrag)
         {
-            SeekToProgressValue();
-            _isDraggingProgress = false;
+            _player.Play();
         }
+        _wasPlayingBeforeDrag = false;
     }
 
     private void ProgressBar_Scroll(object? sender, EventArgs e)
     {
-        if (!_isDraggingProgress)
+        if (_isDraggingProgress)
         {
-            // 键盘操作时直接跳转
-            SeekToProgressValue();
+            // 拖动过程中：请求预览（由定时器节流执行）
+            BeginPreview(_progressBar.Value);
+        }
+        else
+        {
+            // 键盘操作进度条：立即跳转并预览画面
+            PreviewSeek(TrackValueToMs(_progressBar.Value));
         }
     }
 
-    private void SeekToProgressValue()
+    /// <summary>标记待预览位置并启动节流定时器；立即更新时间文字，画面稍后刷新。</summary>
+    private void BeginPreview(int trackValue)
     {
-        if (_player.DurationMs <= 0) return;
+        _pendingPreviewMs = TrackValueToMs(trackValue);
+        _lblCurrentTime.Text = TimeFormatter.Format(_pendingPreviewMs);
+        if (!_previewTimer.Enabled)
+        {
+            _previewTimer.Start();
+        }
+    }
 
-        double ratio = (double)_progressBar.Value / _progressBar.Maximum;
-        long targetMs = (long)(ratio * _player.DurationMs);
-        _player.Seek(targetMs);
-        _lblCurrentTime.Text = TimeFormatter.Format(targetMs);
+    private void PreviewTimer_Tick(object? sender, EventArgs e)
+    {
+        if (!_isDraggingProgress)
+        {
+            _previewTimer.Stop();
+            return;
+        }
+
+        if (_pendingPreviewMs != _lastPreviewMs)
+        {
+            PreviewSeek(_pendingPreviewMs);
+        }
+        else
+        {
+            // 画面已追上最新位置，暂停定时器以节省解码开销
+            _previewTimer.Stop();
+        }
+    }
+
+    /// <summary>跳转到指定时刻并解码显示该处画面帧（帧级精度）。</summary>
+    private void PreviewSeek(long ms)
+    {
+        _lastPreviewMs = ms;
+        _player.SeekPreview(ms);
+    }
+
+    /// <summary>进度条数值换算为毫秒位置。</summary>
+    private long TrackValueToMs(int trackValue)
+    {
+        long dur = _player.DurationMs;
+        if (dur <= 0 || _progressBar.Maximum <= 0) return 0;
+        return (long)((double)trackValue / _progressBar.Maximum * dur);
     }
 
     #endregion
@@ -400,6 +480,8 @@ public partial class MainForm : Form
 
     private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
     {
+        _previewTimer.Stop();
+        _previewTimer.Dispose();
         _player.Dispose();
         lock (_frameLock)
         {
