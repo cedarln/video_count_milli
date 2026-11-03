@@ -667,6 +667,7 @@ public partial class MainForm : Form
         _historyPanel.Width = collapsed ? HistoryCollapsedWidth : HistoryExpandedWidth;
     }
 
+    /// <summary>剪贴板文本：制表符分隔，粘贴到 Excel / 飞书表格即可分列。</summary>
     private string BuildMeasurementsText()
     {
         var sb = new StringBuilder();
@@ -678,6 +679,40 @@ public partial class MainForm : Form
             sb.AppendLine($"{it.SubItems[0].Text}\t{it.SubItems[1].Text}\t{it.SubItems[2].Text}\t{it.SubItems[3].Text}");
         }
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// 导出文件用的 CSV：逗号分隔并按 RFC4180 转义。
+    /// 制表符分隔的内容存成 .csv 时 Excel 不会分列，整份记录会挤在一列里。
+    /// </summary>
+    private string BuildCsvText()
+    {
+        var sb = new StringBuilder();
+        string file = _currentVideoPath != null ? Path.GetFileName(_currentVideoPath) : "";
+        sb.AppendLine(CsvField($"视频: {file}"));
+        sb.AppendLine("序号,起点,终点,耗时");
+        foreach (ListViewItem it in _lvHistory.Items)
+        {
+            sb.AppendLine(string.Join(",", new[]
+            {
+                CsvField(it.SubItems[0].Text),
+                CsvField(it.SubItems[1].Text),
+                CsvField(it.SubItems[2].Text),
+                CsvField(it.SubItems[3].Text)
+            }));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>含逗号、引号或换行时用双引号包裹字段，内部引号翻倍。</summary>
+    private static string CsvField(string value)
+    {
+        if (value.IndexOf(',') < 0 && value.IndexOf('"') < 0 &&
+            value.IndexOf('\r') < 0 && value.IndexOf('\n') < 0)
+        {
+            return value;
+        }
+        return "\"" + value.Replace("\"", "\"\"") + "\"";
     }
 
     private void CopyMeasurements()
@@ -713,7 +748,7 @@ public partial class MainForm : Form
 
         try
         {
-            File.WriteAllText(sfd.FileName, BuildMeasurementsText(), new UTF8Encoding(true));
+            File.WriteAllText(sfd.FileName, BuildCsvText(), new UTF8Encoding(true));
             MessageBox.Show($"已导出：{sfd.FileName}", "导出成功",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -870,6 +905,30 @@ public partial class MainForm : Form
             var progress = new Progress<double>(p => _btnUpdate.Text = $"下载中 {p:F0}%");
             await Updater.DownloadFileAsync(latest.AssetUrl, zipPath, progress);
 
+            // 完整性校验：大小必须与 Release 资产一致；GitHub 提供摘要时再比对 SHA256
+            _btnUpdate.Text = "校验中…";
+            long actualSize = new FileInfo(zipPath).Length;
+            if (latest.AssetSize > 0 && actualSize != latest.AssetSize)
+            {
+                MessageBox.Show(
+                    $"下载文件不完整（实际 {actualSize / 1024 / 1024} MB，应为 " +
+                    $"{latest.AssetSize / 1024 / 1024} MB），已中止更新。",
+                    "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (latest.Sha256 != null)
+            {
+                string actualSha = await Updater.ComputeFileSha256Async(zipPath);
+                if (!string.Equals(actualSha, latest.Sha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    MessageBox.Show(
+                        "下载文件校验失败（SHA256 与 GitHub 上发布的不一致），已中止更新。\n" +
+                        "可能是下载中断或传输内容被改动，请重新尝试。",
+                        "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+            }
+
             _btnUpdate.Text = "解压中…";
             string extractDir = Path.Combine(tempDir, "extract");
             ZipFile.ExtractToDirectory(zipPath, extractDir, overwriteFiles: true);
@@ -890,25 +949,26 @@ public partial class MainForm : Form
                 return;
             }
 
-            // 生成安装脚本：等待本进程退出 → 覆盖程序目录 → 重启
-            string ps1Path = Path.Combine(tempDir, "install_update.ps1");
+            // 安装脚本必须放在 tempDir 之外：正在被 PowerShell 执行的脚本文件
+            // 无法可靠删除，若它位于待清理的 tempDir 内，清理失败会连带跳过重启
+            string ps1Path = Path.Combine(Path.GetTempPath(), "VideoCountMilli_update_install.ps1");
             string exePath = Path.Combine(appDir, "VideoCountMilli.exe");
-            string script =
-                "param([int]$TargetProcId)\r\n" +
-                "$ErrorActionPreference = 'Stop'\r\n" +
-                "try {\r\n" +
-                "    $p = Get-Process -Id $TargetProcId -ErrorAction SilentlyContinue\r\n" +
-                "    if ($p) { $p.WaitForExit(15000) | Out-Null }\r\n" +
-                $"    Copy-Item -Path (Join-Path '{EscapePs(sourceDir)}' '*') -Destination '{EscapePs(appDir)}' -Recurse -Force\r\n" +
-                $"    Remove-Item -Path '{EscapePs(tempDir)}' -Recurse -Force\r\n" +
-                $"    Start-Process -FilePath '{EscapePs(exePath)}'\r\n" +
-                "} catch {\r\n" +
-                $"    $_ | Out-File (Join-Path '{EscapePs(appDir)}' 'update_error.log') -Encoding utf8\r\n" +
-                "}\r\n";
+            string script = Updater.BuildInstallScript(sourceDir, appDir, tempDir, exePath);
             File.WriteAllText(ps1Path, script, new UTF8Encoding(true));
 
+            // 安装会重启程序，而未导出的测量记录不会跨会话保留，重启前先自动备份
+            string backupNote = "";
+            if (_lvHistory.Items.Count > 0)
+            {
+                string? backupPath = BackupMeasurementsBeforeUpdate();
+                backupNote = backupPath != null
+                    ? $"\n\n{_lvHistory.Items.Count} 条测量记录已自动备份到：\n{backupPath}"
+                    : "\n\n注意：测量记录自动备份失败，建议先点「导出CSV」再继续更新。";
+            }
+
             var r2 = MessageBox.Show(
-                "更新包已下载并解压完成。\n\n点击“是”将关闭程序并自动安装更新（完成后程序会自动重启）。\n" +
+                "更新包已下载、校验并解压完成。" + backupNote +
+                "\n\n点击“是”将关闭程序并自动安装更新（完成后程序会自动重启）。\n" +
                 "点击“否”可稍后安装：关闭程序后运行\n" + ps1Path,
                 "检查更新", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
 
@@ -949,8 +1009,6 @@ public partial class MainForm : Form
         return Version.TryParse(raw, out var v) ? v : new Version(0, 0, 0);
     }
 
-    private static string EscapePs(string s) => s.Replace("'", "''");
-
     private static bool IsDirectoryWritable(string dir)
     {
         try
@@ -963,6 +1021,37 @@ public partial class MainForm : Form
         catch
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// 安装更新前把当前测量记录自动备份到「文档\VideoCountMilli_测量备份」。
+    /// 记录列表不落盘、重启即丢失，而自动安装会直接结束本进程，
+    /// 因此不能指望用户记得先手动导出。无记录或备份失败时返回 null。
+    /// </summary>
+    private string? BackupMeasurementsBeforeUpdate()
+    {
+        if (_lvHistory.Items.Count == 0) return null;
+
+        try
+        {
+            string dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                "VideoCountMilli_测量备份");
+            Directory.CreateDirectory(dir);
+
+            string baseName = _currentVideoPath != null
+                ? Path.GetFileNameWithoutExtension(_currentVideoPath)
+                : "measurements";
+            string path = Path.Combine(dir,
+                $"{baseName}_测量记录_{DateTime.Now:yyyyMMdd-HHmmss}.csv");
+
+            File.WriteAllText(path, BuildCsvText(), new UTF8Encoding(true));
+            return path;
+        }
+        catch
+        {
+            return null;
         }
     }
 

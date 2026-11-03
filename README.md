@@ -16,7 +16,7 @@
 - **多段测量记录**：右侧面板可**折叠 / 展开**（默认收起），一次会话可记录多段，列表显示起点 / 终点 / 耗时，支持删除、清空、复制到剪贴板、导出 CSV（表格文件）
 - **帧截图**：一键把当前帧导出为 PNG，文件名自动带上时间戳，作为测量证据
 - **播放体验**：倍速（0.25x–4x）、音量 / 静音（滚轮调音量）、全屏、窗口置顶
-- **检查更新**：一键检查 GitHub 最新版本，自动下载并安装更新（完成后自动重启）
+- **检查更新**：一键检查 GitHub 最新版本，自动下载、校验并安装更新（完成后自动重启）；安装前会把尚未导出的测量记录自动备份到「文档\VideoCountMilli_测量备份」
 - **自定义背景**：视频区背景可选纯色或自定义图片，设置自动记忆
 - 快捷键支持，界面底部有提示
 
@@ -78,7 +78,8 @@ dotnet publish -c Release -r win-x64 --self-contained true -o publish
 - 拖动预览：拖动时实时解码并显示目标时刻的画面帧（按 40ms 节流，避免频繁 seek 卡顿）；拖动期间自动暂停播放，松开后若原先在播放则从新位置继续
 - 逐帧步进：前进直接取解码器下一帧；后退先 seek 到目标帧之前的最近关键帧，再前向解码到目标帧
 - 倍速播放：非原速时音频自动静音，主时钟按速率缩放，加速时丢帧追赶，保证画面速度正确
-- 检查更新：调用 GitHub Releases API 获取最新版本号与安装包，下载解压后由 PowerShell 脚本在本程序退出时完成覆盖安装并重启
+- 检查更新：调用 GitHub Releases API 获取最新版本号、安装包地址与 SHA256 摘要；下载后先比对文件大小与摘要，再由 PowerShell 脚本在本程序退出时完成覆盖安装并重启。安装脚本存放在临时目录之外（`%TEMP%\VideoCountMilli_update_install.ps1`），复制失败也会重启旧版本，错误写入程序目录的 `update_error.log`
+- 测量记录导出：文件为逗号分隔并做 RFC4180 引号转义的真正 CSV（UTF-8 带 BOM，Excel 直接分列）；「复制」到剪贴板仍用制表符分隔，便于粘进表格
 
 ## 目录结构
 
@@ -92,7 +93,7 @@ video_count_milli/
 │   ├── TimelineBar.cs          # 自定义时间轴控件（起终点标记、拖动定位）
 │   ├── TimePointEditor.cs      # 时间点编辑对话框（微调）
 │   ├── BackgroundSettingsDialog.cs # 背景设置对话框（纯色/图片）
-│   ├── Updater.cs              # 检查更新（GitHub Releases API + 下载）
+│   ├── Updater.cs              # 检查更新（GitHub Releases API + 下载 + SHA256 校验）
 │   ├── TimeFormatter.cs        # HH:MM:SS.mmm 格式化/解析
 │   ├── VideoCountMilli.csproj  # 项目配置
 │   ├── Assets/                 # 应用图标（app.ico 多尺寸 + 源图）
