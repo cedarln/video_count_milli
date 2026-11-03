@@ -121,6 +121,19 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     private long _previewCompletedGeneration;  // 已完成到的请求号
     private long _displaySequence;             // 出帧序号（跨解码线程与预览线程全局递增）
 
+    // 拖动预览途中出帧的最小间隔：画面跟着手指动，又不把 UI 队列塞满
+    private const int ScrubDisplayIntervalMs = 40;
+    private const int ScrubForwardContinueMs = 3000; // 往前跳超过这个距离就直接定位，不硬解过去
+    private long _lastScrubDisplayTick;         // 仅预览线程读写
+    private long _scrubProgressMs = -1;         // 本次预览已解到的帧 PTS，仅预览线程读写
+
+    // 定位后到这一刻之前的帧只当参考帧：不显示、不上报位置。
+    // seek 落在目标之前的关键帧，若把这些帧照常播出，播放头会从点击位置退回关键帧那一刻。
+    // C# 不允许 volatile long，统一走 Volatile.Read/Write 的取值方法
+    private long _dropBeforePtsMs = long.MinValue;
+    private long DropFloorMs => Volatile.Read(ref _dropBeforePtsMs);
+    private void SetDropFloor(long ms) => Volatile.Write(ref _dropBeforePtsMs, ms);
+
     // 时间状态（毫秒）
     private long _currentPositionMs;
     private long _durationMs;
@@ -359,6 +372,7 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         _pauseEvent.Set();
         _decodeThread?.Join(2000);
         StopPreviewThread();
+        SetDropFloor(long.MinValue); // 回到起点，门限作废
         // 上面的 join 只是尽力而为：超时说明解码线程还活着，
         // 它会在 _decoderLock 内写音频，这里停音频必须抢同一把锁
         lock (_decoderLock)
@@ -406,6 +420,10 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         {
             lock (_positionLock) { _currentPositionMs = positionMs; }
         }
+
+        // 预览自己决定显示哪些帧，正式解码线程的「目标之前只当参考帧」门限
+        // 由预览的定位阶段重新设定，这里先清掉避免沿用上一次的
+        SetDropFloor(long.MinValue);
 
         lock (_previewLock)
         {
@@ -510,11 +528,12 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     }
 
     /// <summary>
-    /// seek 到目标时刻之前最近的关键帧，向后解码直到第一帧 pts &gt;= 目标并显示。
+    /// seek 到目标时刻之前最近的关键帧，向后解码直到第一帧 pts &gt;= 目标并显示，
+    /// 途中经过的帧也按节流上屏，所以拖动时画面连续变化、不必等手停下来。
     /// 定位只占一小段锁，逐包解码每次只占一个包的锁——长时间霸住 _decoderLock
     /// 会让界面线程的 Play / Seek / StepFrame 等整个 GOP 解完，那正是拖动卡顿的根源。
-    /// 期间若 _previewGeneration 已经前进（手指移走了）或线程被要求停止，
-    /// 立即放弃并返回 -1，把解码器让给下一个目标。
+    /// 手指换了新目标时：往前拖就地接着解（不回关键帧重来），只有往回拖才放弃、
+    /// 由外层用新目标重新定位；播放器被要求停止或已释放时立刻让路。
     /// </summary>
     private long SeekPreviewCore(long positionMs, long generation, PreviewSlot slot)
     {
@@ -536,6 +555,13 @@ public sealed unsafe class FFmpegPlayer : IDisposable
                 ffmpeg.avcodec_flush_buffers(_audioCodecCtx);
 
             ResetAudioClock(positionMs);
+
+            // 这一次定位之后，正式播放解码到这一刻之前的帧只当参考帧：
+            // 松手直接按空格继续播时，播放头才不会从目标退回关键帧
+            SetDropFloor(positionMs - Math.Max(1, (long)Math.Round(_frameDurationMs)));
+            // 新目标：第一帧立刻允许上屏，手指刚开始拖就能看到画面变化
+            _lastScrubDisplayTick = 0;
+            _scrubProgressMs = -1;
         }
 
         AVPacket* packet = ffmpeg.av_packet_alloc();
@@ -545,15 +571,33 @@ public sealed unsafe class FFmpegPlayer : IDisposable
             // 向前解码，显示第一帧 pts >= 目标时刻的画面
             while (true)
             {
-                // 每个包之前检查一次：手指早就移走了就别再解下去了
-                if (IsPreviewStale(slot, generation)) return -1;
+                if (slot.StopRequested || _isDisposed) return -1;
+
+                // 每个包之前对齐一次目标：手指往前挪就顺势续解，往后挪才重新定位
+                long latestGen = Volatile.Read(ref _previewGeneration);
+                if (latestGen != generation)
+                {
+                    if (Volatile.Read(ref _previewCompletedGeneration) >= latestGen)
+                        return -1; // 目标已被取消（正式播放/定位/步进接管），别再抢解码器
+
+                    long latestTarget = Volatile.Read(ref _previewTargetMs);
+                    long refMs = _scrubProgressMs >= 0 ? _scrubProgressMs : positionMs;
+                    long frameMs = Math.Max(1, (long)Math.Round(_frameDurationMs));
+                    if (latestTarget < refMs - frameMs)
+                        return -1; // 往回拖：让外层从新目标的关键帧重新定位
+                    if (latestTarget - refMs > ScrubForwardContinueMs)
+                        return -1; // 一次跳太远：续解要穿过好几秒的画面，不如直接定位
+
+                    generation = latestGen;
+                    positionMs = latestTarget;
+                }
 
                 bool isEof;
                 bool shown = false;
                 lock (_decoderLock)
                 {
                     if (_isDisposed || _fmtCtx == null || _videoCodecCtx == null) return generation;
-                    if (IsPreviewStale(slot, generation)) return -1;
+                    if (slot.StopRequested) return -1;
 
                     int readRet = ffmpeg.av_read_frame(_fmtCtx, packet);
                     if (readRet < 0)
@@ -569,7 +613,7 @@ public sealed unsafe class FFmpegPlayer : IDisposable
                         if (packet->stream_index == _videoStreamIndex)
                         {
                             ffmpeg.avcodec_send_packet(_videoCodecCtx, packet);
-                            shown = DrainAndDisplay(frame, positionMs);
+                            shown = ScrubAndDisplay(frame, positionMs);
                         }
                         ffmpeg.av_packet_unref(packet);
                     }
@@ -597,6 +641,8 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     {
         if (_isDisposed || _fmtCtx == null || _videoCodecCtx == null) return;
         CancelPendingPreview();
+        // 步进的目标帧由步进逻辑自己挑，不能被上一次定位留下的门限挡掉
+        SetDropFloor(long.MinValue);
 
         if (IsPlaying)
         {
@@ -782,6 +828,9 @@ public sealed unsafe class FFmpegPlayer : IDisposable
 
             ResetAudioClock(positionMs);
 
+            // 关键帧到目标之间的帧只作参考帧，允许一帧的取整误差
+            SetDropFloor(positionMs - Math.Max(1, (long)Math.Round(_frameDurationMs)));
+
             lock (_positionLock)
             {
                 _currentPositionMs = positionMs;
@@ -925,6 +974,38 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// 拖动预览专用：从关键帧一路解到目标帧。途中经过的帧按 <see cref="ScrubDisplayIntervalMs"/>
+    /// 节流上屏，手指还在动画面就在变，而不是等手停下来才跳出一帧；
+    /// 这些中途的帧不改播放位置（时间以手指为准），只有到位的那一帧用自身 PTS 落实位置。
+    /// </summary>
+    private bool ScrubAndDisplay(AVFrame* frame, long positionMs)
+    {
+        long floor = positionMs - Math.Max(1, (long)Math.Round(_frameDurationMs));
+        int r;
+        while ((r = ffmpeg.avcodec_receive_frame(_videoCodecCtx, frame)) == 0)
+        {
+            long ptsMs = GetFramePtsMs(frame, _videoStreamIndex);
+            if (ptsMs < 0 || ptsMs >= floor)
+            {
+                _scrubProgressMs = ptsMs >= 0 ? ptsMs : _scrubProgressMs;
+                DisplayFrame(frame);
+                ffmpeg.av_frame_unref(frame);
+                return true;
+            }
+
+            long now = Environment.TickCount64;
+            if (now - _lastScrubDisplayTick >= ScrubDisplayIntervalMs)
+            {
+                _lastScrubDisplayTick = now;
+                _scrubProgressMs = ptsMs;
+                ShowFrame(frame);
+            }
+            ffmpeg.av_frame_unref(frame);
+        }
+        return false;
+    }
+
     /// <summary>显示一帧：更新位置（帧 PTS）并通知界面。</summary>
     private void DisplayFrame(AVFrame* frame)
     {
@@ -938,6 +1019,12 @@ public sealed unsafe class FFmpegPlayer : IDisposable
             PositionChanged?.Invoke(ptsMs);
         }
 
+        ShowFrame(frame);
+    }
+
+    /// <summary>只把帧画上屏，不动播放位置（拖动途中的预览画面）。</summary>
+    private void ShowFrame(AVFrame* frame)
+    {
         Bitmap? bmp = ConvertFrameToBitmap(frame);
         if (bmp != null)
         {
@@ -1071,6 +1158,17 @@ public sealed unsafe class FFmpegPlayer : IDisposable
             long ptsMs = GetFramePtsMs(frame, _videoStreamIndex);
             if (ptsMs >= 0)
             {
+                long floor = DropFloorMs;
+                if (ptsMs < floor)
+                {
+                    // 定位还没落到的参考帧：解出来供后续帧引用即可，
+                    // 既不上屏也不上报位置，否则时间会先从目标退回关键帧
+                    ffmpeg.av_frame_unref(frame);
+                    continue;
+                }
+                if (floor != long.MinValue)
+                    SetDropFloor(long.MinValue); // 一次性，到达目标后失效
+
                 SyncToAudio(ptsMs);
 
                 // 加速播放时，若该帧落后时钟超过一帧，则丢帧追赶
