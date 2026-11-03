@@ -32,6 +32,7 @@ public class TimePointEditor : Form
         StartPosition = FormStartPosition.CenterParent;
         ClientSize = new Size(384, 178);
         Font = new Font("Segoe UI", 9F);
+        Theme.DarkForm(this);
 
         var lbl = new Label
         {
@@ -47,6 +48,7 @@ public class TimePointEditor : Form
             Font = new Font("Consolas", 11F),
             Text = TimeFormatter.Format(_value)
         };
+        Theme.DarkTextBox(_txtTime);
         _txtTime.KeyDown += TxtTime_KeyDown;
 
         // 微调按钮（两行三列）
@@ -67,6 +69,7 @@ public class TimePointEditor : Form
                 FlatStyle = FlatStyle.Flat,
                 Tag = deltas[i]
             };
+            Theme.StyleNeutral(b);
             b.Click += Nudge_Click;
             Controls.Add(b);
         }
@@ -74,7 +77,7 @@ public class TimePointEditor : Form
         var lblHint = new Label
         {
             Text = "可点击右侧按钮微调，或直接输入时间后回车。\n范围：00:00:00.000 ~ " + TimeFormatter.Format(_durationMs),
-            ForeColor = Color.Gray,
+            ForeColor = Theme.TextMuted,
             Font = new Font("Segoe UI", 8F),
             Location = new Point(12, 68),
             Size = new Size(168, 34)
@@ -87,6 +90,7 @@ public class TimePointEditor : Form
             Size = new Size(75, 30),
             FlatStyle = FlatStyle.Flat
         };
+        Theme.StyleNeutral(btnClear);
         btnClear.Click += (s, e) =>
         {
             ResultValue = null;
@@ -100,6 +104,7 @@ public class TimePointEditor : Form
             Location = new Point(216, 110),
             Size = new Size(75, 30)
         };
+        Theme.StyleAccent(btnOk);
         btnOk.Click += (s, e) => ApplyAndClose();
 
         var btnCancel = new Button
@@ -108,6 +113,7 @@ public class TimePointEditor : Form
             Location = new Point(300, 110),
             Size = new Size(75, 30)
         };
+        Theme.StyleNeutral(btnCancel);
         btnCancel.Click += (s, e) =>
         {
             DialogResult = DialogResult.Cancel;

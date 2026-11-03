@@ -75,7 +75,9 @@ dotnet publish -c Release -r win-x64 --self-contained true -o publish
 - 视频解码：[FFmpeg.AutoGen](https://github.com/Ruslan-B/FFmpeg.AutoGen) 8.1 绑定 + FFmpeg 8.1.2 共享库（`VideoCountMilli/ffmpeg/` 目录随仓库分发，运行时需与 exe 同目录）
 - 音频播放：[NAudio](https://github.com/naudio/NAudio)（WaveOut）
 - 计时原理：解码帧的 PTS 按流时间基换算为毫秒，作为唯一时间源；进度条拖动采用关键帧回退 + 前向解码，保证显示时间与画面严格对应
-- 拖动预览：拖动时实时解码并显示目标时刻的画面帧（按 40ms 节流，避免频繁 seek 卡顿）；拖动期间自动暂停播放，松开后若原先在播放则从新位置继续
+- 画面转换：`sws_scale` 直接写进 `LockBits` 的 `Scan0`（按 GDI+ 的 4 字节行对齐处理），不再每帧分配一个大数组中转，减少拖动预览时的 GC 压力
+- 界面：暗色配色集中在 `Theme.cs`，`MainForm.Designer.cs` 只保留结构与尺寸，按钮有悬停/按下/禁用三态反馈
+- 拖动预览：seek 与前向解码跑在独立的预览线程上，UI 线程不等解码结果，所以拖动时播放头和时间戳一直跟手；同一时刻只保留最新目标，手指移走后还没解完的旧目标会主动丢弃。拖动期间自动暂停播放，松手时最多等 250ms 让最终位置的画面解出来，若原先在播放则从新位置继续
 - 逐帧步进：前进直接取解码器下一帧；后退先 seek 到目标帧之前的最近关键帧，再前向解码到目标帧
 - 倍速播放：非原速时音频自动静音，主时钟按速率缩放，加速时丢帧追赶，保证画面速度正确
 - 检查更新：调用 GitHub Releases API 获取最新版本号、安装包地址与 SHA256 摘要；下载后先比对文件大小与摘要，再由 PowerShell 脚本在本程序退出时完成覆盖安装并重启。安装脚本存放在临时目录之外（`%TEMP%\VideoCountMilli_update_install.ps1`），复制失败也会重启旧版本，错误写入程序目录的 `update_error.log`
@@ -93,6 +95,7 @@ video_count_milli/
 │   ├── TimelineBar.cs          # 自定义时间轴控件（起终点标记、拖动定位）
 │   ├── TimePointEditor.cs      # 时间点编辑对话框（微调）
 │   ├── BackgroundSettingsDialog.cs # 背景设置对话框（纯色/图片）
+│   ├── Theme.cs                # 暗色配色表与按钮三态样式
 │   ├── Updater.cs              # 检查更新（GitHub Releases API + 下载 + SHA256 校验）
 │   ├── TimeFormatter.cs        # HH:MM:SS.mmm 格式化/解析
 │   ├── VideoCountMilli.csproj  # 项目配置

@@ -43,7 +43,9 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     #region 事件
 
     /// <summary>视频帧解码完成，参数为当前帧的位图。</summary>
-    public event Action<Bitmap>? FrameDecoded;
+    /// <summary>解出一帧可显示（Bitmap 由接收方负责释放）。long 为出帧序号，
+    /// 用于让界面丢弃排队过程中已经过时的旧帧，避免拖动时画面滞后于手指。</summary>
+    public event Action<Bitmap, long>? FrameDecoded;
 
     /// <summary>播放位置变化（毫秒）。</summary>
     public event Action<long>? PositionChanged;
@@ -98,9 +100,26 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     private Thread? _decodeThread;
     private readonly ManualResetEventSlim _pauseEvent = new(true);
 
-    // 解码器/封装器互斥锁：解码线程、Seek、逐帧步进共用，
+    // 解码器/封装器互斥锁：解码线程、Seek、逐帧步进、预览线程共用，
     // 避免对 AVFormatContext/AVCodecContext 的并发访问
     private readonly object _decoderLock = new();
+
+    // 拖动预览后台线程。seek + 前向解码在长 GOP 下可能几十毫秒一个来回，
+    // 放在 UI 线程上会把鼠标处理和重绘一起拖住（表现为拖动“一卡一卡”）。
+    // 这里只保留最新目标：手指移走后还没解完的旧目标会被主动丢弃。
+    private sealed class PreviewSlot
+    {
+        public readonly ManualResetEventSlim Signal = new(false);
+        public volatile bool StopRequested;
+        public Thread? Thread;
+    }
+
+    private readonly object _previewLock = new();
+    private PreviewSlot? _previewSlot;
+    private long _previewTargetMs = -1;
+    private long _previewGeneration;           // 每次请求 +1
+    private long _previewCompletedGeneration;  // 已完成到的请求号
+    private long _displaySequence;             // 出帧序号（跨解码线程与预览线程全局递增）
 
     // 时间状态（毫秒）
     private long _currentPositionMs;
@@ -246,6 +265,10 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     {
         if (_isDisposed || _fmtCtx == null) return;
 
+        // 拖动留下的待解码目标不能再解了：它会把已经开始播放的解码器和时钟拽回旧位置
+        CancelPendingPreview();
+        WaitForPreviewIdle(150);
+
         if (!_isRunning)
         {
             // 已播放到结尾时，从头开始
@@ -325,16 +348,23 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     public void Stop()
     {
         if (_isDisposed) return;
+        StopInternal(notifyUi: true);
+    }
+
+    private void StopInternal(bool notifyUi)
+    {
         _isRunning = false;
         _isPaused = false;
         _pauseEvent.Set();
         _decodeThread?.Join(2000);
+        StopPreviewThread();
         _waveOut?.Stop();
         _waveProvider?.ClearBuffer();
         _audioStopwatch.Reset();
         _audioBytesWritten = 0;
         _audioBytesConsumedBase = 0;
         lock (_positionLock) { _currentPositionMs = 0; }
+        if (!notifyUi) return; // 退出流程：只停线程，不再回调界面
         PositionChanged?.Invoke(0);
         PlayStateChanged?.Invoke(false);
     }
@@ -345,6 +375,7 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     public void Seek(long positionMs)
     {
         if (_isDisposed || _fmtCtx == null) return;
+        CancelPendingPreview();
 
         positionMs = Math.Clamp(positionMs, 0, Math.Max(0, _durationMs));
         SeekInternal(positionMs);
@@ -352,21 +383,153 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     }
 
     /// <summary>
-    /// 跳转到指定毫秒并立即解码、显示该时刻的画面帧（用于拖动进度条时实时预览）。
-    /// 显示后位置会更新为该帧的真实 PTS，保证时间显示与实际画面一致。
+    /// 请求跳转到指定毫秒并预览该处画面：seek 与解码跑在独立线程上，UI 线程不等待。
+    /// 拖动进度条时每个鼠标移动都会调用，只有最新目标会被解码，
+    /// 已经开始但已过时的解码会在下一个包之前主动退出。
     /// </summary>
-    public void SeekPreview(long positionMs)
+    public void BeginSeekPreview(long positionMs)
     {
         if (_isDisposed || _fmtCtx == null || _videoCodecCtx == null) return;
 
         positionMs = Math.Clamp(positionMs, 0, Math.Max(0, _durationMs));
 
+        lock (_previewLock)
+        {
+            _previewTargetMs = positionMs;
+            _previewGeneration++;
+            EnsurePreviewThread();
+        }
+    }
+
+    /// <summary>
+    /// 等后台预览把最新目标解出来（松手恢复播放前调用，避免先闪一帧旧画面）。
+    /// 超时立即返回，不让长 GOP 卡住界面。
+    /// </summary>
+    public void WaitForPreviewIdle(int timeoutMs)
+    {
+        long deadline = Environment.TickCount64 + Math.Max(0, timeoutMs);
+        while (Environment.TickCount64 < deadline)
+        {
+            long pending;
+            lock (_previewLock)
+            {
+                pending = _previewGeneration - _previewCompletedGeneration;
+            }
+            if (pending <= 0) return;
+            Thread.Sleep(4);
+        }
+    }
+
+    /// <summary>
+    /// 丢弃尚未处理的预览目标（正式播放 / 定位 / 逐帧步进前调用）。
+    /// 代数 +1 让在飞的解码在下一个包之前主动退出，同时把完成号对齐，表示没有待办。
+    /// </summary>
+    public void CancelPendingPreview()
+    {
+        lock (_previewLock)
+        {
+            _previewGeneration++;
+            _previewCompletedGeneration = _previewGeneration;
+        }
+    }
+
+    private void EnsurePreviewThread()
+    {
+        PreviewSlot? slot = _previewSlot;
+        if (slot == null || slot.StopRequested || slot.Thread is not { IsAlive: true })
+        {
+            slot = new PreviewSlot();
+            slot.Thread = new Thread(() => PreviewLoop(slot)) { IsBackground = true, Name = "FFmpegPreview" };
+            _previewSlot = slot;
+            slot.Thread.Start();
+        }
+        slot.Signal.Set();
+    }
+
+    private void StopPreviewThread()
+    {
+        PreviewSlot? slot;
+        lock (_previewLock)
+        {
+            slot = _previewSlot;
+            _previewSlot = null;
+            if (slot != null)
+            {
+                _previewCompletedGeneration = _previewGeneration;
+                slot.StopRequested = true;
+                slot.Signal.Set();
+            }
+        }
+        if (slot?.Thread == null) return;
+
+        if (slot.Thread.Join(2000))
+        {
+            slot.Signal.Dispose();
+        }
+        // .join 超时说明线程还压在解码里：让它自行退出，
+        // 此时不再复用该 slot，也不释放它还在等待的事件句柄
+    }
+
+    private void PreviewLoop(PreviewSlot slot)
+    {
+        while (!slot.StopRequested && !_isDisposed)
+        {
+            slot.Signal.Wait(200);
+            if (slot.StopRequested || _isDisposed) break;
+
+            long target;
+            long generation;
+            bool hasWork;
+            lock (_previewLock)
+            {
+                hasWork = _previewCompletedGeneration < _previewGeneration;
+                // 必须在锁内清信号：与 BeginSeekPreview 的 Set 互斥，
+                // 既不会漏掉刚提出的目标，也不会带着置位空转
+                slot.Signal.Reset();
+                target = _previewTargetMs;
+                generation = _previewGeneration;
+            }
+            if (!hasWork) continue;
+
+            long completedGeneration;
+            try
+            {
+                completedGeneration = SeekPreviewCore(target, generation, slot);
+            }
+            catch (Exception ex)
+            {
+                OnError($"画面预览异常: {ex.Message}");
+                completedGeneration = generation; // 失败也算处理完，避免等待方白等一个超时
+            }
+
+            if (completedGeneration < 0) continue; // 被更新的目标取代，接着解最新的
+
+            lock (_previewLock)
+            {
+                if (completedGeneration > _previewCompletedGeneration)
+                {
+                    _previewCompletedGeneration = completedGeneration;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// seek 到目标时刻之前最近的关键帧，向后解码直到第一帧 pts &gt;= 目标并显示。
+    /// 期间若 _previewGeneration 已经前进（手指移走了）或线程被要求停止，
+    /// 立即放弃并返回 -1，把解码器让给下一个目标。
+    /// </summary>
+    private long SeekPreviewCore(long positionMs, long generation, PreviewSlot slot)
+    {
         AVPacket* packet = ffmpeg.av_packet_alloc();
         AVFrame* frame = ffmpeg.av_frame_alloc();
         try
         {
             lock (_decoderLock)
             {
+                if (_isDisposed || _fmtCtx == null || _videoCodecCtx == null) return generation;
+                if (IsPreviewStale(slot, generation)) return -1;
+
                 long targetTimestamp = (long)(positionMs * ffmpeg.AV_TIME_BASE / 1000.0);
                 int ret = ffmpeg.av_seek_frame(_fmtCtx, -1, targetTimestamp,
                     ffmpeg.AVSEEK_FLAG_BACKWARD);
@@ -389,13 +552,16 @@ public sealed unsafe class FFmpegPlayer : IDisposable
                 // 向前解码，显示第一帧 pts >= 目标时刻的画面
                 while (true)
                 {
+                    // 每个包之前检查一次：手指早就移走了就别再解下去了
+                    if (IsPreviewStale(slot, generation)) return -1;
+
                     int readRet = ffmpeg.av_read_frame(_fmtCtx, packet);
                     if (readRet < 0)
                     {
                         // 到达文件末尾：刷新解码器，显示剩余最后一帧
                         ffmpeg.avcodec_send_packet(_videoCodecCtx, null);
                         DrainAndDisplay(frame, long.MinValue / 2);
-                        return;
+                        return generation;
                     }
 
                     if (packet->stream_index == _videoStreamIndex)
@@ -403,7 +569,7 @@ public sealed unsafe class FFmpegPlayer : IDisposable
                         ffmpeg.avcodec_send_packet(_videoCodecCtx, packet);
                         bool shown = DrainAndDisplay(frame, positionMs);
                         ffmpeg.av_packet_unref(packet);
-                        if (shown) return;
+                        if (shown) return generation;
                     }
                     else
                     {
@@ -412,16 +578,16 @@ public sealed unsafe class FFmpegPlayer : IDisposable
                 }
             }
         }
-        catch (Exception ex)
-        {
-            OnError($"画面预览异常: {ex.Message}");
-        }
         finally
         {
             ffmpeg.av_packet_free(&packet);
             ffmpeg.av_frame_free(&frame);
         }
     }
+
+    /// <summary>本次预览是否已无意义：被更新的目标取代、正在关闭播放器，或线程正在停止。</summary>
+    private bool IsPreviewStale(PreviewSlot slot, long generation) =>
+        slot.StopRequested || _isDisposed || Volatile.Read(ref _previewGeneration) != generation;
 
     /// <summary>
     /// 逐帧步进。direction &gt; 0 为下一帧，direction &lt; 0 为上一帧。
@@ -430,6 +596,7 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     public void StepFrame(int direction)
     {
         if (_isDisposed || _fmtCtx == null || _videoCodecCtx == null) return;
+        CancelPendingPreview();
 
         if (IsPlaying)
         {
@@ -498,7 +665,10 @@ public sealed unsafe class FFmpegPlayer : IDisposable
 
     public void Close()
     {
-        Stop();
+        // Dispose 已经把 _isDisposed 置位，此时 public Stop() 会直接返回；
+        // 必须走 StopInternal 把解码线程和预览线程 join 掉，
+        // 否则下面 Cleanup() 释放上下文时线程还在 av_read_frame 里用它们
+        StopInternal(notifyUi: !_isDisposed);
         Cleanup();
     }
 
@@ -771,7 +941,8 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         Bitmap? bmp = ConvertFrameToBitmap(frame);
         if (bmp != null)
         {
-            FrameDecoded?.Invoke(bmp);
+            long seq = Interlocked.Increment(ref _displaySequence);
+            FrameDecoded?.Invoke(bmp, seq);
         }
     }
 
@@ -1058,45 +1229,72 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         lock (_positionLock) { return _currentPositionMs; }
     }
 
+    /// <summary>
+    /// 把解码帧转成 24 位位图。直接把 sws 输出写进 LockBits 的 Scan0：
+    /// 既省掉每帧一次约 width*height*3 的大数组分配（1080p 约 6MB，落在大对象堆上，
+    /// 拖动预览时会造成明显 GC 压力），也避免按“行长 = 宽*3”假设拷贝而漏掉
+    /// GDI+ 的 4 字节行对齐（宽度不是 4 的倍数时画面会斜）。
+    /// </summary>
     private Bitmap? ConvertFrameToBitmap(AVFrame* frame)
     {
         if (_swsCtx == null) return null;
 
-        int stride = _videoWidth * 3; // RGB24
-        byte[] rgbBuffer = new byte[stride * _videoHeight];
-
-        fixed (byte* rgbPtr = rgbBuffer)
+        byte*[] srcData =
         {
-            byte*[] srcData =
-            {
-                frame->data[0], frame->data[1], frame->data[2], frame->data[3],
-                frame->data[4], frame->data[5], frame->data[6], frame->data[7]
-            };
-            int[] srcStride =
-            {
-                (int)frame->linesize[0], (int)frame->linesize[1], (int)frame->linesize[2], (int)frame->linesize[3],
-                (int)frame->linesize[4], (int)frame->linesize[5], (int)frame->linesize[6], (int)frame->linesize[7]
-            };
-            byte*[] dstData = { rgbPtr };
-            int[] dstStride = { stride };
-
-            ffmpeg.sws_scale(_swsCtx,
-                srcData, srcStride, 0, _videoHeight,
-                dstData, dstStride);
-        }
+            frame->data[0], frame->data[1], frame->data[2], frame->data[3],
+            frame->data[4], frame->data[5], frame->data[6], frame->data[7]
+        };
+        int[] srcStride =
+        {
+            (int)frame->linesize[0], (int)frame->linesize[1], (int)frame->linesize[2], (int)frame->linesize[3],
+            (int)frame->linesize[4], (int)frame->linesize[5], (int)frame->linesize[6], (int)frame->linesize[7]
+        };
 
         Bitmap bmp = new(_videoWidth, _videoHeight, PixelFormat.Format24bppRgb);
-        Rectangle rect = new(0, 0, _videoWidth, _videoHeight);
-        BitmapData bmpData = bmp.LockBits(rect, ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
+        BitmapData? bmpData = null;
         try
         {
-            Marshal.Copy(rgbBuffer, 0, bmpData.Scan0, rgbBuffer.Length);
-        }
-        finally
-        {
+            bmpData = bmp.LockBits(
+                new Rectangle(0, 0, _videoWidth, _videoHeight),
+                ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
+
+            byte*[] dstData = { (byte*)bmpData.Scan0.ToInt64() };
+            int[] dstStride = { bmpData.Stride };
+
+            int scaled = ffmpeg.sws_scale(_swsCtx,
+                srcData, srcStride, 0, _videoHeight,
+                dstData, dstStride);
+
+            if (scaled < 0)
+            {
+                bmp.UnlockBits(bmpData);
+                bmp.Dispose();
+                return null;
+            }
+
+            // GDI+ 把行补齐到 4 字节，补齐的尾部不属于画面；
+            // LockBits 的内存不是零初始化的，不清的话非 4 倍宽的视频右缘会有噪点
+            int pad = bmpData.Stride - _videoWidth * 3;
+            if (pad > 0)
+            {
+                byte* scan = (byte*)bmpData.Scan0.ToInt64();
+                for (int y = 0; y < _videoHeight; y++)
+                {
+                    byte* rowEnd = scan + (long)y * bmpData.Stride + _videoWidth * 3;
+                    for (int i = 0; i < pad; i++) rowEnd[i] = 0;
+                }
+            }
             bmp.UnlockBits(bmpData);
+            bmpData = null;
+            return bmp;
         }
-        return bmp;
+        catch
+        {
+            // 转换失败：这一帧不显示，但要把锁过的内存还回去并丢弃位图
+            if (bmpData != null) bmp.UnlockBits(bmpData);
+            bmp.Dispose();
+            return null;
+        }
     }
 
     private void OnError(string msg)
@@ -1123,11 +1321,16 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         }
         _waveProvider = null;
 
-        if (_swrCtx != null) { SwrContext* swr = _swrCtx; ffmpeg.swr_free(&swr); _swrCtx = null; }
-        if (_swsCtx != null) { ffmpeg.sws_freeContext(_swsCtx); _swsCtx = null; }
-        if (_videoCodecCtx != null) { AVCodecContext* vc = _videoCodecCtx; ffmpeg.avcodec_free_context(&vc); _videoCodecCtx = null; }
-        if (_audioCodecCtx != null) { AVCodecContext* ac = _audioCodecCtx; ffmpeg.avcodec_free_context(&ac); _audioCodecCtx = null; }
-        if (_fmtCtx != null) { AVFormatContext* fc = _fmtCtx; ffmpeg.avformat_close_input(&fc); _fmtCtx = null; }
+        // 解码线程与预览线程都在 _decoderLock 内碰这些上下文，释放时抢同一把锁；
+        // 线程已经停干净时拿锁是即时的
+        lock (_decoderLock)
+        {
+            if (_swrCtx != null) { SwrContext* swr = _swrCtx; ffmpeg.swr_free(&swr); _swrCtx = null; }
+            if (_swsCtx != null) { ffmpeg.sws_freeContext(_swsCtx); _swsCtx = null; }
+            if (_videoCodecCtx != null) { AVCodecContext* vc = _videoCodecCtx; ffmpeg.avcodec_free_context(&vc); _videoCodecCtx = null; }
+            if (_audioCodecCtx != null) { AVCodecContext* ac = _audioCodecCtx; ffmpeg.avcodec_free_context(&ac); _audioCodecCtx = null; }
+            if (_fmtCtx != null) { AVFormatContext* fc = _fmtCtx; ffmpeg.avformat_close_input(&fc); _fmtCtx = null; }
+        }
 
         _videoStreamIndex = -1;
         _audioStreamIndex = -1;

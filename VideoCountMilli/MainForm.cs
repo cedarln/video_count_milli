@@ -20,11 +20,15 @@ public partial class MainForm : Form
     private Bitmap? _currentFrame;
     private readonly object _frameLock = new();
 
-    // 拖动时间轴时的实时画面预览（节流，避免频繁 seek 造成卡顿）
+    // 拖动时间轴时的实时画面预览（后台线程解码，只追最新位置）
     private bool _wasPlayingBeforeDrag;
-    private readonly System.Windows.Forms.Timer _previewTimer = new();
-    private long _pendingPreviewMs = -1;
-    private long _lastPreviewMs = -1;
+    private long _dragPreviewMs = -1;
+    private long _lastPreviewRequestTick;
+    private int _dragSession;                  // 拖动轮次，防止上一轮的收尾踩到下一轮
+    private long _displayedFrameSeq;           // 已显示帧的出帧序号
+
+    /// <summary>拖动时向预览线程提目标的最小间隔：文字始终跟手，画面按此限速。</summary>
+    private const int PreviewMinIntervalMs = 25;
 
     // 音量 / 全屏
     private double _volume = 1.0;
@@ -45,6 +49,7 @@ public partial class MainForm : Form
     public MainForm()
     {
         InitializeComponent();
+        ApplyTheme();
         _player = new FFmpegPlayer();
 
         // 绑定播放器事件
@@ -54,10 +59,6 @@ public partial class MainForm : Form
         _player.PlayStateChanged += OnPlayStateChanged;
         _player.PlaybackEnded += OnPlaybackEnded;
         _player.Error += OnPlayerError;
-
-        // 拖动时间轴时的画面预览节流定时器（40ms 执行一次 seek+解码）
-        _previewTimer.Interval = 40;
-        _previewTimer.Tick += PreviewTimer_Tick;
 
         // 播放控制按钮
         _btnOpen.Click += BtnOpen_Click;
@@ -149,6 +150,133 @@ public partial class MainForm : Form
         }
     }
 
+    #region 界面配色
+
+    /// <summary>
+    /// 应用暗色配色（色值集中定义在 Theme）。Designer 里只写结构、尺寸与字体，
+    /// 所有颜色在这里统一赋值，换皮肤不会牵动布局。
+    /// </summary>
+    private void ApplyTheme()
+    {
+        BackColor = Theme.Window;
+        _videoPictureBox.BackColor = Theme.Window;
+
+        _controlPanel.BackColor = Theme.Panel;
+        _historyPanel.BackColor = Theme.Panel;
+        _historyButtons.BackColor = Theme.Panel;
+        _historyHeader.BackColor = Theme.Raised;
+
+        _lblFileInfo.ForeColor = Theme.TextSecondary;
+        _lblCurrentTime.ForeColor = Theme.Text;
+        _lblDuration.ForeColor = Theme.TextSecondary;
+        _lblSep.ForeColor = Theme.TextMuted;
+        _lblStartTime.ForeColor = Theme.Accent;
+        _lblEndTime.ForeColor = Theme.Warm;
+        _lblSegmentDuration.ForeColor = Theme.Success;
+        _lblShortcuts.ForeColor = Theme.TextMuted;
+        _lblSpeed.ForeColor = Theme.TextSecondary;
+        _lblVolume.ForeColor = Theme.TextSecondary;
+        _lblHistoryTitle.ForeColor = Theme.Text;
+
+        foreach (var cb in new[] { _chkTopMost, _chkMute, _chkLoopRegion })
+        {
+            cb.ForeColor = Theme.Text;
+            cb.BackColor = Theme.Panel;
+        }
+
+        _cboSpeed.FlatStyle = FlatStyle.Flat;
+        _cboSpeed.BackColor = Theme.ButtonFace;
+        _cboSpeed.ForeColor = Theme.Text;
+        _trkVolume.BackColor = Theme.Panel;
+
+        // 主操作：起点相关用强调蓝，终点相关用橙，其余为中性灰
+        Theme.StyleAccent(_btnSetStart);
+        Theme.StyleAccent(_btnAddMeasure);
+        Theme.StyleWarm(_btnSetEnd);
+        foreach (var b in new[]
+        {
+            _btnOpen, _btnPlay, _btnPause, _btnStop, _btnPrevFrame, _btnNextFrame,
+            _btnSnapshot, _btnFullscreen, _btnUpdate, _btnBackground,
+            _btnEditStart, _btnEditEnd, _btnJumpStart, _btnJumpEnd, _btnToggleHistory,
+            _btnDelMeasure, _btnClearMeasure, _btnCopyMeasure, _btnExportMeasure
+        })
+        {
+            Theme.StyleNeutral(b);
+        }
+
+        ApplyHistoryListTheme();
+    }
+
+    /// <summary>
+    /// 测量记录列表自绘：原生 ListView 在暗色下会留白底列头和亮色选中条，
+    /// 因此接管绘制，配色跟随 Theme，并给奇偶行加斑马纹。
+    /// </summary>
+    private void ApplyHistoryListTheme()
+    {
+        _lvHistory.BackColor = Theme.ListBackground;
+        _lvHistory.ForeColor = Theme.Text;
+        _lvHistory.OwnerDraw = true;
+        _lvHistory.DrawColumnHeader += LvHistory_DrawColumnHeader;
+        _lvHistory.DrawItem += (s, e) => e.DrawDefault = false;
+        _lvHistory.DrawSubItem += LvHistory_DrawSubItem;
+    }
+
+    private void LvHistory_DrawColumnHeader(object? sender, DrawListViewColumnHeaderEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        using (var back = new SolidBrush(Theme.Raised))
+        {
+            g.FillRectangle(back, e.Bounds);
+        }
+        var textRect = new Rectangle(e.Bounds.X + 4, e.Bounds.Y, e.Bounds.Width - 6, e.Bounds.Height);
+        TextRenderer.DrawText(g, e.Header?.Text ?? "", e.Font ?? _lvHistory.Font, textRect, Theme.TextSecondary,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+        using (var pen = new Pen(Theme.ListGrid))
+        {
+            g.DrawLine(pen, e.Bounds.Right - 1, e.Bounds.Top + 3, e.Bounds.Right - 1, e.Bounds.Bottom - 3);
+            g.DrawLine(pen, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right - 1, e.Bounds.Bottom - 1);
+        }
+    }
+
+    private void LvHistory_DrawSubItem(object? sender, DrawListViewSubItemEventArgs e)
+    {
+        ListViewItem? item = e.Item;
+        Graphics g = e.Graphics;
+        bool selected = item?.Selected == true;
+        Color backColor = selected
+            ? Theme.Accent
+            : (item?.Index ?? 0) % 2 == 1 ? Theme.ListZebra : Theme.ListBackground;
+
+        // FullRowSelect 下最后一列右侧不会被逐个回调覆盖，首列时先把整行铺满
+        if (e.ColumnIndex == 0 && item != null)
+        {
+            using var rowBrush = new SolidBrush(backColor);
+            Rectangle row = item.Bounds;
+            g.FillRectangle(rowBrush, 0, row.Y, _lvHistory.ClientSize.Width, row.Height);
+        }
+
+        using (var brush = new SolidBrush(backColor))
+        {
+            g.FillRectangle(brush, e.Bounds);
+        }
+
+        Color foreColor = selected
+            ? Theme.Window
+            : e.ColumnIndex == _lvHistory.Columns.Count - 1 ? Theme.Success : Theme.Text;
+
+        var textRect = new Rectangle(e.Bounds.X + 4, e.Bounds.Y, e.Bounds.Width - 6, e.Bounds.Height);
+        TextRenderer.DrawText(g, e.SubItem?.Text ?? "", e.SubItem?.Font ?? _lvHistory.Font, textRect, foreColor,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+
+        using (var pen = new Pen(Theme.ListGrid))
+        {
+            g.DrawLine(pen, e.Bounds.Right - 1, e.Bounds.Top, e.Bounds.Right - 1, e.Bounds.Bottom - 1);
+            g.DrawLine(pen, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right - 1, e.Bounds.Bottom - 1);
+        }
+    }
+
+    #endregion
+
     #region 文件操作
 
     private void BtnOpen_Click(object? sender, EventArgs e)
@@ -222,9 +350,8 @@ public partial class MainForm : Form
                 _timeline.StartMarker = null;
                 _timeline.EndMarker = null;
 
-                _lastPreviewMs = -1;
-                _pendingPreviewMs = -1;
-                _previewTimer.Stop();
+                // 上一次拖动的位置在新文件里不成立
+                _dragPreviewMs = -1;
 
                 _lblDuration.Text = TimeFormatter.Format(_player.DurationMs);
 
@@ -331,7 +458,7 @@ public partial class MainForm : Form
 
     #region 播放器事件
 
-    private void OnFrameDecoded(Bitmap frame)
+    private void OnFrameDecoded(Bitmap frame, long sequence)
     {
         if (this.IsDisposed)
         {
@@ -341,9 +468,18 @@ public partial class MainForm : Form
 
         if (this.InvokeRequired)
         {
-            this.BeginInvoke(new Action<Bitmap>(OnFrameDecoded), frame);
+            this.BeginInvoke(new Action<Bitmap, long>(OnFrameDecoded), frame, sequence);
             return;
         }
+
+        // 排队期间解出来的旧帧：直接丢，画面只认最新那张，
+        // 否则拖动时界面会把已经过时的中间帧挨个补播一遍，看着就是慢半拍
+        if (sequence < Volatile.Read(ref _displayedFrameSeq))
+        {
+            frame.Dispose();
+            return;
+        }
+        Volatile.Write(ref _displayedFrameSeq, sequence);
 
         Bitmap? oldFrame;
         lock (_frameLock)
@@ -379,12 +515,12 @@ public partial class MainForm : Form
             }
         }
 
-        _lblCurrentTime.Text = TimeFormatter.Format(positionMs);
+        // 拖动期间界面由手指驱动：后台预览回调的位置可能已经落后好几个鼠标位置，
+        // 让它写进来会把播放头和时间戳往回拽，看起来就是一顿一顿的
+        if (_isDraggingTimeline) return;
 
-        if (!_isDraggingTimeline)
-        {
-            _timeline.Value = positionMs;
-        }
+        _lblCurrentTime.Text = TimeFormatter.Format(positionMs);
+        _timeline.Value = positionMs;
     }
 
     private void OnDurationChanged(long durationMs)
@@ -436,6 +572,8 @@ public partial class MainForm : Form
     private void Timeline_DragStarted()
     {
         _isDraggingTimeline = true;
+        _dragSession++;
+        _lastPreviewRequestTick = 0;
         _wasPlayingBeforeDrag = _player.IsPlaying;
         if (_wasPlayingBeforeDrag)
         {
@@ -445,17 +583,57 @@ public partial class MainForm : Form
 
     private void Timeline_SeekPreview(long ms)
     {
-        BeginPreview(ms);
+        // 文字立即跟手；画面交给后台预览线程，UI 线程一帧都不等
+        _dragPreviewMs = ms;
+        _lblCurrentTime.Text = TimeFormatter.Format(ms);
+        RequestPreview(ms);
+    }
+
+    /// <summary>
+    /// 向预览线程提目标。鼠标移动比解码快得多，限速后既省 CPU，
+    /// 也避免解码帧在 UI 消息队列里堆成一串大图。
+    /// </summary>
+    private void RequestPreview(long ms)
+    {
+        long now = Environment.TickCount64;
+        if (now - _lastPreviewRequestTick < PreviewMinIntervalMs) return;
+        _lastPreviewRequestTick = now;
+        _player.BeginSeekPreview(ms);
     }
 
     private void Timeline_SeekCompleted()
     {
-        _isDraggingTimeline = false;
-        _previewTimer.Stop();
+        long target = _dragPreviewMs;
+        int session = _dragSession;
+        _dragPreviewMs = -1;
 
-        if (_pendingPreviewMs >= 0)
+        if (target >= 0)
         {
-            PreviewSeek(_pendingPreviewMs);
+            // 最后一次移动可能被限速挡掉了，这里补提一次，保证画面停在手指位置
+            _player.BeginSeekPreview(target);
+
+            // 松手后最多等 250ms 让这一帧解出来再恢复播放，避免先闪一帧旧画面；
+            // 超时则直接以解码器当前位置继续，迟到的那一帧由 Play 取消掉
+            _player.WaitForPreviewIdle(250);
+        }
+
+        long settledMs = _player.CurrentPositionMs;
+
+        if (this.IsDisposed || !this.IsHandleCreated)
+        {
+            _isDraggingTimeline = false;
+        }
+        else
+        {
+            // 抑制标志留到这一轮消息走完再清：拖动期间排进队列的位置回调如果晚于
+            // 这里落地，会把播放头从刚定下的位置往回拽一下
+            this.BeginInvoke(new Action(() =>
+            {
+                if (_dragSession != session) return; // 已经开始了下一次拖动，由它自己收尾
+                _isDraggingTimeline = false;
+                _lblCurrentTime.Text = TimeFormatter.Format(settledMs);
+                _timeline.Value = settledMs;
+            }));
         }
 
         if (_wasPlayingBeforeDrag)
@@ -465,42 +643,6 @@ public partial class MainForm : Form
         _wasPlayingBeforeDrag = false;
     }
 
-    /// <summary>标记待预览位置并启动节流定时器；立即更新时间文字，画面稍后刷新。</summary>
-    private void BeginPreview(long ms)
-    {
-        _pendingPreviewMs = ms;
-        _lblCurrentTime.Text = TimeFormatter.Format(ms);
-        if (!_previewTimer.Enabled)
-        {
-            _previewTimer.Start();
-        }
-    }
-
-    private void PreviewTimer_Tick(object? sender, EventArgs e)
-    {
-        if (!_isDraggingTimeline)
-        {
-            _previewTimer.Stop();
-            return;
-        }
-
-        if (_pendingPreviewMs != _lastPreviewMs)
-        {
-            PreviewSeek(_pendingPreviewMs);
-        }
-        else
-        {
-            _previewTimer.Stop();
-        }
-    }
-
-    /// <summary>跳转到指定时刻并解码显示该处画面帧（帧级精度）。</summary>
-    private void PreviewSeek(long ms)
-    {
-        _lastPreviewMs = ms;
-        _player.SeekPreview(ms);
-    }
-
     #endregion
 
     #region 跳转
@@ -508,7 +650,8 @@ public partial class MainForm : Form
     private void JumpToPoint(long? ms)
     {
         if (!_fileOpened || !ms.HasValue) return;
-        PreviewSeek(ms.Value);
+        _lblCurrentTime.Text = TimeFormatter.Format(ms.Value);
+        _player.BeginSeekPreview(ms.Value);
     }
 
     private void JumpToMeasurementStart()
@@ -1106,7 +1249,7 @@ public partial class MainForm : Form
                 {
                     using var tmp = Image.FromFile(imgPath);
                     _backgroundImagePath = imgPath;
-                    ApplyBackground(Color.Black, new Bitmap(tmp), save: false);
+                    ApplyBackground(Theme.Window, new Bitmap(tmp), save: false);
                 }
             }
             else
@@ -1145,8 +1288,6 @@ public partial class MainForm : Form
 
     private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
     {
-        _previewTimer.Stop();
-        _previewTimer.Dispose();
         _player.Dispose();
         lock (_frameLock)
         {

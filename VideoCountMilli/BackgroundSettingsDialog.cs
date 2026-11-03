@@ -38,6 +38,7 @@ public class BackgroundSettingsDialog : Form
         StartPosition = FormStartPosition.CenterParent;
         ClientSize = new Size(430, 200);
         Font = new Font("Segoe UI", 9F);
+        Theme.DarkForm(this);
 
         var lbl = new Label
         {
@@ -56,19 +57,24 @@ public class BackgroundSettingsDialog : Form
         var btnPickColor = new Button { Text = "选择颜色…", Location = new Point(228, 36), Size = new Size(92, 30) };
         var btnPickImage = new Button { Text = "选择图片…", Location = new Point(228, 72), Size = new Size(92, 30) };
         var btnReset = new Button { Text = "恢复默认", Location = new Point(228, 108), Size = new Size(92, 30) };
+        Theme.StyleNeutral(btnPickColor);
         btnPickColor.Click += (s, e) => PickColor();
+        Theme.StyleNeutral(btnPickImage);
         btnPickImage.Click += (s, e) => PickImage();
+        Theme.StyleNeutral(btnReset);
         btnReset.Click += (s, e) =>
         {
             SetImage(null, owned: false);
-            _color = Color.Black;
+            _color = Theme.Window;
             _useImage = false;
             ApplyPreview();
         };
 
         var btnOk = new Button { Text = "确定", Location = new Point(238, 162), Size = new Size(82, 30) };
         var btnCancel = new Button { Text = "取消", Location = new Point(330, 162), Size = new Size(82, 30) };
+        Theme.StyleAccent(btnOk);
         btnOk.Click += (s, e) => { DialogResult = DialogResult.OK; Close(); };
+        Theme.StyleNeutral(btnCancel);
         btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
 
         Controls.AddRange(new Control[] { lbl, _preview, btnPickColor, btnPickImage, btnReset, btnOk, btnCancel });
@@ -142,6 +148,6 @@ public class BackgroundSettingsDialog : Form
     {
         _preview.BackgroundImage = _useImage ? _image : null;
         _preview.BackgroundImageLayout = ImageLayout.Zoom;
-        _preview.BackColor = _useImage ? Color.Black : _color;
+        _preview.BackColor = _useImage ? Theme.Window : _color;
     }
 }
