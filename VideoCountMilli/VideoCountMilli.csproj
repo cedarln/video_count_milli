@@ -7,11 +7,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <ApplicationIcon />
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <StartupObject>VideoCountMilli.Program</StartupObject>
     <AssemblyName>VideoCountMilli</AssemblyName>
     <RootNamespace>VideoCountMilli</RootNamespace>
-    <Version>1.3.1</Version>
+    <Version>1.4.0</Version>
     <Company>VideoCountMilli</Company>
     <Product>VideoCountMilli</Product>
     <Copyright>Copyright © 2026</Copyright>
@@ -24,5 +24,9 @@
     <None Update="ffmpeg\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+  </ItemGroup>
+  <ItemGroup>
+    <!-- 窗口 / 任务栏图标（exe 图标由 ApplicationIcon 指定） -->
+    <EmbeddedResource Include="Assets\app.ico" />
   </ItemGroup>
 </Project>

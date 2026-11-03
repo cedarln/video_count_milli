@@ -27,6 +27,8 @@ partial class MainForm
     private Button _btnNextFrame;
     private Button _btnSnapshot;
     private Button _btnFullscreen;
+    private Button _btnUpdate;
+    private Button _btnBackground;
     private CheckBox _chkTopMost;
     private ComboBox _cboSpeed;
     private TrackBar _trkVolume;
@@ -87,25 +89,31 @@ partial class MainForm
         };
 
         // ---------- 底部控制面板 ----------
+        // 显式设置宽度作为子控件锚点参考，避免按默认 200px 捕获锚点距离，
+        // 导致时间轴等左右锚定的控件布局后宽出窗口（播放头越界不可见）
         _controlPanel = new Panel
         {
             Dock = DockStyle.Bottom,
-            Height = 224,
+            Size = new Size(1000, 224),
             BackColor = Color.FromArgb(40, 40, 40)
         };
 
-        // 第 1 行：文件信息
+        // 第 1 行：文件信息 + 更新 / 背景按钮
         _lblFileInfo = new Label
         {
             Text = "未打开文件",
             ForeColor = Color.LightGray,
             AutoSize = false,
+            AutoEllipsis = true,
             Location = new Point(12, 6),
-            Size = new Size(970, 18),
+            Size = new Size(780, 18),
             TextAlign = ContentAlignment.MiddleLeft,
             Font = new Font("Segoe UI", 9F),
             Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
         };
+
+        _btnUpdate = new Button { Text = "检查更新", Location = new Point(806, 2), Size = new Size(92, 24), BackColor = Color.FromArgb(70, 70, 70), FlatStyle = FlatStyle.Flat, ForeColor = Color.White, Font = new Font("Segoe UI", 8.5F), Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        _btnBackground = new Button { Text = "背景…", Location = new Point(902, 2), Size = new Size(86, 24), BackColor = Color.FromArgb(70, 70, 70), FlatStyle = FlatStyle.Flat, ForeColor = Color.White, Font = new Font("Segoe UI", 8.5F), Anchor = AnchorStyles.Top | AnchorStyles.Right };
 
         // 第 2 行：当前时间 / 总时长
         _lblCurrentTime = new Label
@@ -233,6 +241,7 @@ partial class MainForm
         {
             _lblFileInfo, _lblCurrentTime, lblSep, _lblDuration,
             _timeline,
+            _btnUpdate, _btnBackground,
             _btnOpen, _btnPlay, _btnPause, _btnStop, _btnPrevFrame, _btnNextFrame,
             _btnSnapshot, _btnFullscreen, _chkTopMost, lblSpeed, _cboSpeed, lblVolume, _trkVolume, _chkMute,
             _btnSetStart, _lblStartTime, _btnEditStart,

@@ -2,7 +2,9 @@ using System;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
+using System.IO.Compression;
 using System.Text;
+using System.Text.Json;
 using System.Windows.Forms;
 
 namespace VideoCountMilli;
@@ -35,6 +37,10 @@ public partial class MainForm : Form
     private const int HistoryExpandedWidth = 340;
     private const int HistoryCollapsedWidth = 30;
     private bool _historyCollapsed;
+
+    // 背景设置
+    private string? _backgroundImagePath;
+    private bool _updateInProgress;
 
     public MainForm()
     {
@@ -103,6 +109,10 @@ public partial class MainForm : Form
         _btnToggleHistory.Click += (s, e) => SetHistoryCollapsed(!_historyCollapsed);
         _lvHistory.MouseDoubleClick += (s, e) => JumpToMeasurementStart();
 
+        // 更新检查 / 背景设置按钮
+        _btnUpdate.Click += BtnUpdate_Click;
+        _btnBackground.Click += BtnBackground_Click;
+
         // 拖放文件支持
         this.AllowDrop = true;
         this.DragEnter += MainForm_DragEnter;
@@ -113,6 +123,30 @@ public partial class MainForm : Form
         this.KeyDown += MainForm_KeyDown;
 
         this.FormClosing += MainForm_FormClosing;
+
+        // 测量记录面板默认收起
+        SetHistoryCollapsed(true);
+
+        // 显式校正时间轴宽度，确保时间轴右边界与窗口右边距一致（修复越界）
+        _timeline.Width = _controlPanel.ClientSize.Width - 24;
+
+        // 加载用户设置（背景）
+        LoadSettings();
+
+        // 窗口 / 任务栏图标（嵌入资源，资源名 = 默认命名空间.相对路径）
+        try
+        {
+            using var iconStream = System.Reflection.Assembly.GetExecutingAssembly()
+                .GetManifestResourceStream("VideoCountMilli.Assets.app.ico");
+            if (iconStream != null)
+            {
+                Icon = new Icon(iconStream);
+            }
+        }
+        catch
+        {
+            // 图标加载失败时使用默认图标，不影响运行
+        }
     }
 
     #region 文件操作
@@ -777,6 +811,242 @@ public partial class MainForm : Form
 
             _isFullscreen = false;
             _btnFullscreen.Text = "全屏";
+        }
+    }
+
+    #endregion
+
+    #region 更新检查
+
+    private async void BtnUpdate_Click(object? sender, EventArgs e)
+    {
+        if (_updateInProgress) return;
+        _updateInProgress = true;
+        string oldText = _btnUpdate.Text;
+        _btnUpdate.Enabled = false;
+        try
+        {
+            _btnUpdate.Text = "检查中…";
+            Updater.ReleaseInfo? latest;
+            try
+            {
+                latest = await Updater.GetLatestReleaseAsync();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"检查更新失败：{ex.Message}\n\n请检查网络连接。", "检查更新",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (latest == null)
+            {
+                MessageBox.Show("未能获取最新版本信息，或最新版本没有可用的安装包。", "检查更新",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            Version current = GetCurrentVersion();
+            if (latest.Version <= current)
+            {
+                MessageBox.Show($"当前已是最新版本（v{current}）。", "检查更新",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            long mb = Math.Max(1, latest.AssetSize / 1024 / 1024);
+            var r = MessageBox.Show(
+                $"发现新版本 {latest.Tag}（当前 v{current}）。\n是否下载更新？约 {mb} MB。",
+                "检查更新", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (r != DialogResult.Yes) return;
+
+            // 下载到临时目录
+            string tempDir = Path.Combine(Path.GetTempPath(), "VideoCountMilli_update");
+            try { Directory.Delete(tempDir, true); } catch { /* 清理旧目录失败可忽略 */ }
+            Directory.CreateDirectory(tempDir);
+            string zipPath = Path.Combine(tempDir, "update.zip");
+
+            _btnUpdate.Text = "下载中 0%";
+            var progress = new Progress<double>(p => _btnUpdate.Text = $"下载中 {p:F0}%");
+            await Updater.DownloadFileAsync(latest.AssetUrl, zipPath, progress);
+
+            _btnUpdate.Text = "解压中…";
+            string extractDir = Path.Combine(tempDir, "extract");
+            ZipFile.ExtractToDirectory(zipPath, extractDir, overwriteFiles: true);
+
+            // zip 内含单个顶层文件夹时进入该文件夹
+            string sourceDir = extractDir;
+            string[] subDirs = Directory.GetDirectories(extractDir);
+            if (subDirs.Length == 1 && Directory.GetFiles(extractDir).Length == 0)
+            {
+                sourceDir = subDirs[0];
+            }
+
+            string appDir = AppContext.BaseDirectory;
+            if (!IsDirectoryWritable(appDir))
+            {
+                MessageBox.Show($"程序目录不可写，无法自动安装。\n更新包已下载到：\n{zipPath}\n请手动解压并覆盖程序目录。",
+                    "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // 生成安装脚本：等待本进程退出 → 覆盖程序目录 → 重启
+            string ps1Path = Path.Combine(tempDir, "install_update.ps1");
+            string exePath = Path.Combine(appDir, "VideoCountMilli.exe");
+            string script =
+                "param([int]$TargetProcId)\r\n" +
+                "$ErrorActionPreference = 'Stop'\r\n" +
+                "try {\r\n" +
+                "    $p = Get-Process -Id $TargetProcId -ErrorAction SilentlyContinue\r\n" +
+                "    if ($p) { $p.WaitForExit(15000) | Out-Null }\r\n" +
+                $"    Copy-Item -Path (Join-Path '{EscapePs(sourceDir)}' '*') -Destination '{EscapePs(appDir)}' -Recurse -Force\r\n" +
+                $"    Remove-Item -Path '{EscapePs(tempDir)}' -Recurse -Force\r\n" +
+                $"    Start-Process -FilePath '{EscapePs(exePath)}'\r\n" +
+                "} catch {\r\n" +
+                $"    $_ | Out-File (Join-Path '{EscapePs(appDir)}' 'update_error.log') -Encoding utf8\r\n" +
+                "}\r\n";
+            File.WriteAllText(ps1Path, script, new UTF8Encoding(true));
+
+            var r2 = MessageBox.Show(
+                "更新包已下载并解压完成。\n\n点击“是”将关闭程序并自动安装更新（完成后程序会自动重启）。\n" +
+                "点击“否”可稍后安装：关闭程序后运行\n" + ps1Path,
+                "检查更新", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+
+            if (r2 == DialogResult.Yes)
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = $"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{ps1Path}\" {Environment.ProcessId}",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                System.Diagnostics.Process.Start(psi);
+                Application.Exit();
+            }
+            else
+            {
+                MessageBox.Show($"已取消自动安装。可关闭程序后运行：\n{ps1Path}", "检查更新",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"更新失败：{ex.Message}", "检查更新",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            _btnUpdate.Text = oldText;
+            _btnUpdate.Enabled = true;
+            _updateInProgress = false;
+        }
+    }
+
+    private static Version GetCurrentVersion()
+    {
+        string raw = Application.ProductVersion.Split('+')[0];
+        return Version.TryParse(raw, out var v) ? v : new Version(0, 0, 0);
+    }
+
+    private static string EscapePs(string s) => s.Replace("'", "''");
+
+    private static bool IsDirectoryWritable(string dir)
+    {
+        try
+        {
+            string probe = Path.Combine(dir, ".write_test_" + Guid.NewGuid().ToString("N"));
+            File.WriteAllText(probe, "t");
+            File.Delete(probe);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    #endregion
+
+    #region 背景设置
+
+    private void BtnBackground_Click(object? sender, EventArgs e)
+    {
+        using var dlg = new BackgroundSettingsDialog(
+            _videoPictureBox.BackColor, _videoPictureBox.BackgroundImage);
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        ApplyBackground(dlg.SelectedColor, dlg.SelectedImage, save: true);
+    }
+
+    private void ApplyBackground(Color color, Image? image, bool save)
+    {
+        var oldImage = _videoPictureBox.BackgroundImage;
+        _videoPictureBox.BackColor = color;
+        _videoPictureBox.BackgroundImage = image;
+        _videoPictureBox.BackgroundImageLayout = image != null ? ImageLayout.Zoom : ImageLayout.None;
+
+        if (!ReferenceEquals(oldImage, image))
+        {
+            oldImage?.Dispose();
+        }
+
+        if (save)
+        {
+            SaveSettings();
+        }
+    }
+
+    private static string SettingsFilePath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "VideoCountMilli", "settings.json");
+
+    private void LoadSettings()
+    {
+        try
+        {
+            string path = SettingsFilePath;
+            if (!File.Exists(path)) return;
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            int mode = doc.RootElement.GetProperty("mode").GetInt32();
+            if (mode == 1)
+            {
+                string imgPath = doc.RootElement.GetProperty("image").GetString() ?? "";
+                if (imgPath.Length > 0 && File.Exists(imgPath))
+                {
+                    using var tmp = Image.FromFile(imgPath);
+                    _backgroundImagePath = imgPath;
+                    ApplyBackground(Color.Black, new Bitmap(tmp), save: false);
+                }
+            }
+            else
+            {
+                int argb = doc.RootElement.GetProperty("argb").GetInt32();
+                ApplyBackground(Color.FromArgb(argb), null, save: false);
+            }
+        }
+        catch
+        {
+            // 设置文件损坏时忽略，使用默认背景
+        }
+    }
+
+    private void SaveSettings()
+    {
+        try
+        {
+            string? dir = Path.GetDirectoryName(SettingsFilePath);
+            if (dir != null) Directory.CreateDirectory(dir);
+
+            string json = _videoPictureBox.BackgroundImage != null
+                ? JsonSerializer.Serialize(new { mode = 1, argb = 0, image = _backgroundImagePath ?? "" })
+                : JsonSerializer.Serialize(new { mode = 0, argb = _videoPictureBox.BackColor.ToArgb(), image = "" });
+            File.WriteAllText(SettingsFilePath, json);
+        }
+        catch
+        {
+            // 保存失败时忽略
         }
     }
 
