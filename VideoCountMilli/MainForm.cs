@@ -609,15 +609,18 @@ public partial class MainForm : Form
 
         if (target >= 0)
         {
-            // 最后一次移动可能被限速挡掉了，这里补提一次，保证画面停在手指位置
-            _player.BeginSeekPreview(target);
-
-            // 松手后最多等 250ms 让这一帧解出来再恢复播放，避免先闪一帧旧画面；
-            // 超时则直接以解码器当前位置继续，迟到的那一帧由 Play 取消掉
-            _player.WaitForPreviewIdle(250);
+            // 最后一次移动可能被限速挡掉了，这里补提一次，保证停在手指位置。
+            // 要恢复播放时走同步定位：seek + 清缓冲 + 复位时钟都很便宜（预览解码已按包让锁），
+            // 主时钟在解除暂停前就落在目标位置，不会先把时间拽回拖前那点再跳回来；
+            // 只是暂停着看画面时不用等，交给预览线程把这一帧解出来
+            if (_wasPlayingBeforeDrag)
+                _player.Seek(target);
+            else
+                _player.BeginSeekPreview(target);
         }
 
-        long settledMs = _player.CurrentPositionMs;
+        // 位置以手指为准，不在 UI 线程等后台解码：松手时睡上几百毫秒正是「一卡一卡」的来源
+        long settledMs = target >= 0 ? target : _player.CurrentPositionMs;
 
         if (this.IsDisposed || !this.IsHandleCreated)
         {

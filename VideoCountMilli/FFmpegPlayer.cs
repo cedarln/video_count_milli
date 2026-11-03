@@ -265,9 +265,10 @@ public sealed unsafe class FFmpegPlayer : IDisposable
     {
         if (_isDisposed || _fmtCtx == null) return;
 
-        // 拖动留下的待解码目标不能再解了：它会把已经开始播放的解码器和时钟拽回旧位置
+        // 拖动留下的待解码目标不能再解了：它会把已经开始播放的解码器和时钟拽回旧位置。
+        // 取消后在飞的预览会在下一个包之前自己退出，位置已由 BeginSeekPreview 落实，
+        // 这里不需要等它
         CancelPendingPreview();
-        WaitForPreviewIdle(150);
 
         if (!_isRunning)
         {
@@ -358,8 +359,13 @@ public sealed unsafe class FFmpegPlayer : IDisposable
         _pauseEvent.Set();
         _decodeThread?.Join(2000);
         StopPreviewThread();
-        _waveOut?.Stop();
-        _waveProvider?.ClearBuffer();
+        // 上面的 join 只是尽力而为：超时说明解码线程还活着，
+        // 它会在 _decoderLock 内写音频，这里停音频必须抢同一把锁
+        lock (_decoderLock)
+        {
+            _waveOut?.Stop();
+            _waveProvider?.ClearBuffer();
+        }
         _audioStopwatch.Reset();
         _audioBytesWritten = 0;
         _audioBytesConsumedBase = 0;
@@ -393,30 +399,19 @@ public sealed unsafe class FFmpegPlayer : IDisposable
 
         positionMs = Math.Clamp(positionMs, 0, Math.Max(0, _durationMs));
 
+        // 拖动期间播放器是暂停的，此时手指位置就是权威位置：先把它落实，
+        // 界面和随后的 Play/Pause 读到的都是目标时刻，不必等后台把这一帧解出来。
+        // 正在播放时不抢这个先——主时钟还停在旧基准上，会立刻把位置算回去
+        if (!_isRunning || _isPaused)
+        {
+            lock (_positionLock) { _currentPositionMs = positionMs; }
+        }
+
         lock (_previewLock)
         {
             _previewTargetMs = positionMs;
             _previewGeneration++;
             EnsurePreviewThread();
-        }
-    }
-
-    /// <summary>
-    /// 等后台预览把最新目标解出来（松手恢复播放前调用，避免先闪一帧旧画面）。
-    /// 超时立即返回，不让长 GOP 卡住界面。
-    /// </summary>
-    public void WaitForPreviewIdle(int timeoutMs)
-    {
-        long deadline = Environment.TickCount64 + Math.Max(0, timeoutMs);
-        while (Environment.TickCount64 < deadline)
-        {
-            long pending;
-            lock (_previewLock)
-            {
-                pending = _previewGeneration - _previewCompletedGeneration;
-            }
-            if (pending <= 0) return;
-            Thread.Sleep(4);
         }
     }
 
@@ -516,66 +511,71 @@ public sealed unsafe class FFmpegPlayer : IDisposable
 
     /// <summary>
     /// seek 到目标时刻之前最近的关键帧，向后解码直到第一帧 pts &gt;= 目标并显示。
+    /// 定位只占一小段锁，逐包解码每次只占一个包的锁——长时间霸住 _decoderLock
+    /// 会让界面线程的 Play / Seek / StepFrame 等整个 GOP 解完，那正是拖动卡顿的根源。
     /// 期间若 _previewGeneration 已经前进（手指移走了）或线程被要求停止，
     /// 立即放弃并返回 -1，把解码器让给下一个目标。
     /// </summary>
     private long SeekPreviewCore(long positionMs, long generation, PreviewSlot slot)
     {
+        lock (_decoderLock)
+        {
+            if (_isDisposed || _fmtCtx == null || _videoCodecCtx == null) return generation;
+            if (IsPreviewStale(slot, generation)) return -1;
+
+            long targetTimestamp = (long)(positionMs * ffmpeg.AV_TIME_BASE / 1000.0);
+            int ret = ffmpeg.av_seek_frame(_fmtCtx, -1, targetTimestamp,
+                ffmpeg.AVSEEK_FLAG_BACKWARD);
+            if (ret < 0)
+            {
+                ffmpeg.avformat_seek_file(_fmtCtx, -1, 0, targetTimestamp, targetTimestamp, 0);
+            }
+
+            ffmpeg.avcodec_flush_buffers(_videoCodecCtx);
+            if (_audioCodecCtx != null)
+                ffmpeg.avcodec_flush_buffers(_audioCodecCtx);
+
+            ResetAudioClock(positionMs);
+        }
+
         AVPacket* packet = ffmpeg.av_packet_alloc();
         AVFrame* frame = ffmpeg.av_frame_alloc();
         try
         {
-            lock (_decoderLock)
+            // 向前解码，显示第一帧 pts >= 目标时刻的画面
+            while (true)
             {
-                if (_isDisposed || _fmtCtx == null || _videoCodecCtx == null) return generation;
+                // 每个包之前检查一次：手指早就移走了就别再解下去了
                 if (IsPreviewStale(slot, generation)) return -1;
 
-                long targetTimestamp = (long)(positionMs * ffmpeg.AV_TIME_BASE / 1000.0);
-                int ret = ffmpeg.av_seek_frame(_fmtCtx, -1, targetTimestamp,
-                    ffmpeg.AVSEEK_FLAG_BACKWARD);
-                if (ret < 0)
+                bool isEof;
+                bool shown = false;
+                lock (_decoderLock)
                 {
-                    ffmpeg.avformat_seek_file(_fmtCtx, -1, 0, targetTimestamp, targetTimestamp, 0);
-                }
-
-                ffmpeg.avcodec_flush_buffers(_videoCodecCtx);
-                if (_audioCodecCtx != null)
-                    ffmpeg.avcodec_flush_buffers(_audioCodecCtx);
-
-                ResetAudioClock(positionMs);
-
-                lock (_positionLock)
-                {
-                    _currentPositionMs = positionMs;
-                }
-
-                // 向前解码，显示第一帧 pts >= 目标时刻的画面
-                while (true)
-                {
-                    // 每个包之前检查一次：手指早就移走了就别再解下去了
+                    if (_isDisposed || _fmtCtx == null || _videoCodecCtx == null) return generation;
                     if (IsPreviewStale(slot, generation)) return -1;
 
                     int readRet = ffmpeg.av_read_frame(_fmtCtx, packet);
                     if (readRet < 0)
                     {
                         // 到达文件末尾：刷新解码器，显示剩余最后一帧
+                        isEof = true;
                         ffmpeg.avcodec_send_packet(_videoCodecCtx, null);
                         DrainAndDisplay(frame, long.MinValue / 2);
-                        return generation;
-                    }
-
-                    if (packet->stream_index == _videoStreamIndex)
-                    {
-                        ffmpeg.avcodec_send_packet(_videoCodecCtx, packet);
-                        bool shown = DrainAndDisplay(frame, positionMs);
-                        ffmpeg.av_packet_unref(packet);
-                        if (shown) return generation;
                     }
                     else
                     {
+                        isEof = false;
+                        if (packet->stream_index == _videoStreamIndex)
+                        {
+                            ffmpeg.avcodec_send_packet(_videoCodecCtx, packet);
+                            shown = DrainAndDisplay(frame, positionMs);
+                        }
                         ffmpeg.av_packet_unref(packet);
                     }
                 }
+
+                if (isEof || shown) return generation;
             }
         }
         finally
@@ -1314,17 +1314,17 @@ public sealed unsafe class FFmpegPlayer : IDisposable
 
     private void Cleanup()
     {
-        if (_waveOut != null)
-        {
-            try { _waveOut.Stop(); _waveOut.Dispose(); } catch { }
-            _waveOut = null;
-        }
-        _waveProvider = null;
-
-        // 解码线程与预览线程都在 _decoderLock 内碰这些上下文，释放时抢同一把锁；
-        // 线程已经停干净时拿锁是即时的
+        // 解码线程与预览线程都在 _decoderLock 内碰这些上下文和音频对象，
+        // 释放时抢同一把锁；线程已经停干净时拿锁是即时的
         lock (_decoderLock)
         {
+            if (_waveOut != null)
+            {
+                try { _waveOut.Stop(); _waveOut.Dispose(); } catch { }
+                _waveOut = null;
+            }
+            _waveProvider = null;
+
             if (_swrCtx != null) { SwrContext* swr = _swrCtx; ffmpeg.swr_free(&swr); _swrCtx = null; }
             if (_swsCtx != null) { ffmpeg.sws_freeContext(_swsCtx); _swsCtx = null; }
             if (_videoCodecCtx != null) { AVCodecContext* vc = _videoCodecCtx; ffmpeg.avcodec_free_context(&vc); _videoCodecCtx = null; }
